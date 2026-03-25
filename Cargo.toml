@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/rlua-core",
+  "crates/rlua-parser",
+  "crates/rlua-compiler",
+  "crates/rlua-vm",
+  "crates/rlua-ir",
+  "crates/rlua-jit",
+  "crates/rlua-stdlib",
+  "crates/rlua-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rlua-core = { path = "crates/rlua-core" }
+rlua-parser = { path = "crates/rlua-parser" }
+rlua-compiler = { path = "crates/rlua-compiler" }
+rlua-vm = { path = "crates/rlua-vm" }
+rlua-ir = { path = "crates/rlua-ir" }
+rlua-jit = { path = "crates/rlua-jit" }
+rlua-stdlib = { path = "crates/rlua-stdlib" }

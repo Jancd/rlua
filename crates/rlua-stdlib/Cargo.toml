@@ -1,0 +1,9 @@
+[package]
+name = "rlua-stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rlua-core.workspace = true
+rlua-vm.workspace = true
