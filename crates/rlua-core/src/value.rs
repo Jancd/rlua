@@ -97,7 +97,11 @@ fn lua_format_g(n: f64, precision: usize) -> String {
             let mantissa = &rust_sci[..epos];
             let exp_str = &rust_sci[epos + 1..];
             let exp_val: i32 = exp_str.parse().unwrap_or(0);
-            format!("{mantissa}e{}{:02}", if exp_val >= 0 { "+" } else { "-" }, exp_val.unsigned_abs())
+            format!(
+                "{mantissa}e{}{:02}",
+                if exp_val >= 0 { "+" } else { "-" },
+                exp_val.unsigned_abs()
+            )
         } else {
             rust_sci
         }

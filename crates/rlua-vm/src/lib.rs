@@ -879,10 +879,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     // Lua 5.1: error(msg, level) — if msg is a string and level != 0,
                     // the source location is prepended at error() call time
                     let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
-                    let level = args
-                        .get(1)
-                        .and_then(|v| v.to_number())
-                        .unwrap_or(1.0) as i32;
+                    let level = args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i32;
 
                     let annotated_msg = if level > 0 {
                         if let LuaValue::String(ref s) = msg {
@@ -1020,11 +1017,8 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                             } else if *name == "error" {
                                 // Intercept error() to prepend source location
                                 let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
-                                let level = args
-                                    .get(1)
-                                    .and_then(|v| v.to_number())
-                                    .unwrap_or(1.0)
-                                    as i32;
+                                let level =
+                                    args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i32;
                                 let annotated_msg = if level > 0 {
                                     if let LuaValue::String(ref s) = msg {
                                         let loc = state.source_location();
