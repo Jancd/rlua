@@ -90,3 +90,35 @@ fn tables() {
 fn while_loop() {
     run_lua_file(&conformance_path("while.lua"));
 }
+#[test]
+fn metatables() {
+    run_lua_file(&conformance_path("metatables.lua"));
+}
+#[test]
+fn math_lib() {
+    run_lua_file(&conformance_path("math_lib.lua"));
+}
+#[test]
+fn table_lib() {
+    run_lua_file(&conformance_path("table_lib.lua"));
+}
+#[test]
+fn string_lib() {
+    run_lua_file(&conformance_path("string_lib.lua"));
+}
+#[test]
+fn xpcall_errors() {
+    run_lua_file(&conformance_path("xpcall_errors.lua"));
+}
+#[test]
+fn tailcalls() {
+    run_lua_file(&conformance_path("tailcalls.lua"));
+}
+#[test]
+fn integration() {
+    run_lua_file(&conformance_path("integration.lua"));
+}
+#[test]
+fn gc_stress() {
+    run_lua_file(&conformance_path("gc_stress.lua"));
+}

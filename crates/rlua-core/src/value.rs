@@ -35,7 +35,17 @@ impl LuaValue {
     pub fn to_number(&self) -> Option<f64> {
         match self {
             Self::Number(n) => Some(*n),
-            Self::String(s) => s.trim().parse::<f64>().ok(),
+            Self::String(s) => {
+                let trimmed = s.trim();
+                // Handle hex literals (0x or 0X prefix)
+                if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                    u64::from_str_radix(&trimmed[2..], 16)
+                        .ok()
+                        .map(|n| n as f64)
+                } else {
+                    trimmed.parse::<f64>().ok()
+                }
+            }
             _ => None,
         }
     }
@@ -63,9 +73,57 @@ fn lua_number_to_string(n: f64) -> String {
     } else if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
         format!("{}", n as i64)
     } else {
-        // Lua uses C's "%.14g" format. Rust doesn't have %g directly,
-        // so we use Display which gives a reasonable representation.
-        let s = format!("{n}");
+        // Lua 5.1 uses C's "%.14g" format.
+        // %g uses the shorter of %e and %f, stripping trailing zeros.
+        lua_format_g(n, 14)
+    }
+}
+
+/// Emulate C's `%.*g` format for a float.
+fn lua_format_g(n: f64, precision: usize) -> String {
+    // %g uses %e if the exponent < -4 or >= precision, else %f.
+    // The precision in %g means "significant digits", not decimal places.
+    if n == 0.0 {
+        return "0".into();
+    }
+    let exp = n.abs().log10().floor() as i32;
+    let s = if exp < -4 || exp >= precision as i32 {
+        // Use scientific notation matching C's %e format
+        let prec = precision - 1;
+        let rust_sci = format!("{n:.prec$e}");
+        // Rust outputs "1.23e-5", C outputs "1.23e-05" (min 2-digit exponent with sign)
+        // Parse and reformat the exponent part
+        if let Some(epos) = rust_sci.find('e') {
+            let mantissa = &rust_sci[..epos];
+            let exp_str = &rust_sci[epos + 1..];
+            let exp_val: i32 = exp_str.parse().unwrap_or(0);
+            format!("{mantissa}e{}{:02}", if exp_val >= 0 { "+" } else { "-" }, exp_val.unsigned_abs())
+        } else {
+            rust_sci
+        }
+    } else {
+        // Use fixed-point notation; decimal places = precision - 1 - exp
+        let decimal_places = if precision as i32 - 1 - exp > 0 {
+            (precision as i32 - 1 - exp) as usize
+        } else {
+            0
+        };
+        format!("{n:.decimal_places$}")
+    };
+    // Strip trailing zeros after decimal point (but not in exponent part)
+    if let Some(epos) = s.find('e') {
+        let (mantissa, exp_part) = s.split_at(epos);
+        if mantissa.contains('.') {
+            let trimmed = mantissa.trim_end_matches('0').trim_end_matches('.');
+            format!("{trimmed}{exp_part}")
+        } else {
+            s
+        }
+    } else if s.contains('.') {
+        let s = s.trim_end_matches('0');
+        let s = s.trim_end_matches('.');
+        s.to_string()
+    } else {
         s
     }
 }

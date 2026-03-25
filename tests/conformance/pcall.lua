@@ -8,7 +8,8 @@ assert(result == 42, "pcall success result")
 -- Basic pcall failure
 ok, result = pcall(function() error("boom") end)
 assert(ok == false, "pcall failure ok")
-assert(result == "boom", "pcall failure msg")
+-- Error messages get source location prefix (e.g. "input:9: boom")
+assert(string.find(result, "boom", 1, true), "pcall failure msg")
 
 -- pcall with arguments
 ok, result = pcall(function(a, b) return a + b end, 3, 4)
@@ -43,7 +44,7 @@ assert(ok == false, "pcall non-string error ok")
 -- Assert failure is caught by pcall
 ok, result = pcall(function() assert(false, "failed!") end)
 assert(ok == false, "pcall assert ok")
-assert(result == "failed!", "pcall assert msg")
+assert(string.find(result, "failed!", 1, true), "pcall assert msg")
 
 -- pcall with native function
 ok, result = pcall(tonumber, "42")

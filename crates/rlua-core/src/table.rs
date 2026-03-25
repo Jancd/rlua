@@ -6,15 +6,14 @@ use crate::value::LuaValue;
 pub type TableRef = Rc<RefCell<LuaTable>>;
 
 /// A Lua table with an array part and a hash part.
-///
-/// M1 uses a simple Vec-based hash part (linear scan). M2 will replace this
-/// with a proper open-addressing hash table.
 #[derive(Debug, Clone)]
 pub struct LuaTable {
     /// 1-based array part. Index 0 is unused; array[i] corresponds to Lua index i.
     array: Vec<LuaValue>,
     /// Hash part: linear scan of key-value pairs.
     hash: Vec<(LuaValue, LuaValue)>,
+    /// Optional metatable for metamethod dispatch.
+    metatable: Option<TableRef>,
 }
 
 impl LuaTable {
@@ -22,6 +21,7 @@ impl LuaTable {
         Self {
             array: Vec::new(),
             hash: Vec::new(),
+            metatable: None,
         }
     }
 
@@ -29,6 +29,26 @@ impl LuaTable {
         Self {
             array: Vec::with_capacity(array_size),
             hash: Vec::with_capacity(hash_size),
+            metatable: None,
+        }
+    }
+
+    pub fn metatable(&self) -> Option<&TableRef> {
+        self.metatable.as_ref()
+    }
+
+    pub fn set_metatable(&mut self, mt: Option<TableRef>) {
+        self.metatable = mt;
+    }
+
+    /// Look up a metamethod by name (e.g., "__add") in this table's metatable.
+    pub fn get_metamethod(&self, name: &str) -> Option<LuaValue> {
+        let mt = self.metatable.as_ref()?;
+        let val = mt.borrow().rawget(&LuaValue::from(name));
+        if matches!(val, LuaValue::Nil) {
+            None
+        } else {
+            Some(val)
         }
     }
 
@@ -147,6 +167,18 @@ impl LuaTable {
         }
 
         None
+    }
+
+    /// Iterate all key-value pairs (array + hash) for GC marking.
+    pub fn iter_pairs(&self) -> impl Iterator<Item = (LuaValue, LuaValue)> + '_ {
+        let array_iter = self
+            .array
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !matches!(v, LuaValue::Nil))
+            .map(|(i, v)| (LuaValue::Number((i + 1) as f64), v.clone()));
+        let hash_iter = self.hash.iter().map(|(k, v)| (k.clone(), v.clone()));
+        array_iter.chain(hash_iter)
     }
 
     /// Convert a LuaValue key to an array index (0-based) if it represents a positive integer.

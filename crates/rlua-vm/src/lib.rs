@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use rlua_core::bytecode::RK_OFFSET;
 use rlua_core::function::{Closure, FunctionProto, LuaFunction, NativeFn, UpvalRef};
-use rlua_core::gc::{GcRoot, GcRootProvider, RootSource};
+use rlua_core::gc::{GcRoot, GcRootProvider, MarkSweepGc, RootSource};
 use rlua_core::opcode::Opcode;
-use rlua_core::table::LuaTable;
+use rlua_core::table::{LuaTable, TableRef};
 use rlua_core::value::LuaValue;
 
 // ---------------------------------------------------------------------------
@@ -38,9 +38,9 @@ impl std::fmt::Display for LuaError {
 struct CallFrame {
     closure: Rc<Closure>,
     pc: usize,
-    base: usize, // base register index in the stack
+    base: usize,
     #[allow(dead_code)]
-    num_results: i32, // expected results: -1 = variable, 0+ = fixed
+    num_results: i32,
     varargs: Vec<LuaValue>,
 }
 
@@ -52,12 +52,12 @@ pub struct VmState {
     stack: Vec<LuaValue>,
     frames: Vec<CallFrame>,
     globals: Rc<RefCell<LuaTable>>,
-    /// Output captured during execution (for print).
     output: Vec<String>,
-    /// Open upvalues: maps absolute stack index → shared UpvalRef.
-    /// When a closure captures a stack slot, we create an UpvalRef here.
-    /// Reading/writing that slot goes through the UpvalRef so closures see updates.
     open_upvalues: HashMap<usize, UpvalRef>,
+    /// Shared metatable for all string values.
+    string_metatable: Option<TableRef>,
+    /// GC instance for allocation tracking.
+    gc: MarkSweepGc,
 }
 
 impl VmState {
@@ -68,6 +68,8 @@ impl VmState {
             globals: Rc::new(RefCell::new(LuaTable::new())),
             output: Vec::new(),
             open_upvalues: HashMap::new(),
+            string_metatable: None,
+            gc: MarkSweepGc::new(),
         }
     }
 
@@ -81,6 +83,10 @@ impl VmState {
             func,
         }));
         self.globals.borrow_mut().rawset(LuaValue::from(name), val);
+    }
+
+    pub fn set_string_metatable(&mut self, mt: TableRef) {
+        self.string_metatable = Some(mt);
     }
 
     pub fn get_output(&self) -> &[String] {
@@ -99,7 +105,6 @@ impl VmState {
 
     fn get_reg(&self, base: usize, idx: u8) -> LuaValue {
         let i = base + idx as usize;
-        // Check open upvalues first
         if let Some(uv) = self.open_upvalues.get(&i) {
             return uv.borrow().clone();
         }
@@ -112,7 +117,6 @@ impl VmState {
 
     fn set_reg(&mut self, base: usize, idx: u8, val: LuaValue) {
         let i = base + idx as usize;
-        // If there's an open upvalue, update it
         if let Some(uv) = self.open_upvalues.get(&i) {
             *uv.borrow_mut() = val.clone();
         }
@@ -129,7 +133,6 @@ impl VmState {
         }
     }
 
-    /// Get or create an open upvalue for the given absolute stack index.
     fn get_or_create_open_upvalue(&mut self, abs_idx: usize) -> UpvalRef {
         if let Some(uv) = self.open_upvalues.get(&abs_idx) {
             return uv.clone();
@@ -144,9 +147,67 @@ impl VmState {
         uv
     }
 
-    /// Close upvalues at or above the given absolute stack index.
     fn close_upvalues(&mut self, from_abs: usize) {
         self.open_upvalues.retain(|&idx, _| idx < from_abs);
+    }
+
+    /// Get metamethod for a value (table metatable, or string metatable).
+    fn get_metamethod(&self, val: &LuaValue, name: &str) -> Option<LuaValue> {
+        match val {
+            LuaValue::Table(t) => t.borrow().get_metamethod(name),
+            LuaValue::String(_) => {
+                let mt = self.string_metatable.as_ref()?;
+                let mm = mt.borrow().rawget(&LuaValue::from(name));
+                if matches!(mm, LuaValue::Nil) {
+                    None
+                } else {
+                    Some(mm)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the current source location (source:line) from the top call frame.
+    fn source_location(&self) -> String {
+        if let Some(frame) = self.frames.last() {
+            let proto = &frame.closure.proto;
+            let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+            let line = proto.line_info.get(pc).copied().unwrap_or(0);
+            let source = if proto.source_name.is_empty() {
+                "?"
+            } else {
+                &proto.source_name
+            };
+            if line > 0 {
+                format!("{source}:{line}")
+            } else {
+                source.to_string()
+            }
+        } else {
+            "?".to_string()
+        }
+    }
+
+    /// Notify GC of an allocation and run collection if threshold exceeded.
+    fn notify_alloc(&mut self) {
+        if self.gc.notify_alloc() {
+            self.run_gc();
+        }
+    }
+
+    fn run_gc(&mut self) {
+        // Collect roots first, then run GC (avoids borrow conflict on self)
+        let mut roots = Vec::new();
+        self.gc_roots(&mut roots);
+        struct RootList(Vec<GcRoot>);
+        impl GcRootProvider for RootList {
+            fn gc_roots(&self, out: &mut Vec<GcRoot>) {
+                out.extend(self.0.iter().cloned());
+            }
+        }
+        let provider = RootList(roots);
+        self.gc.collect(&[&provider]);
     }
 }
 
@@ -158,7 +219,6 @@ impl Default for VmState {
 
 impl GcRootProvider for VmState {
     fn gc_roots(&self, roots: &mut Vec<GcRoot>) {
-        // Stack/register roots
         for val in &self.stack {
             if !matches!(val, LuaValue::Nil) {
                 roots.push(GcRoot {
@@ -167,18 +227,175 @@ impl GcRootProvider for VmState {
                 });
             }
         }
-        // Global table root
         roots.push(GcRoot {
             source: RootSource::Globals,
             value: LuaValue::Table(self.globals.clone()),
         });
-        // Open upvalue roots
         for uv in self.open_upvalues.values() {
             roots.push(GcRoot {
                 source: RootSource::OpenUpvalues,
                 value: uv.borrow().clone(),
             });
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metamethod helpers
+// ---------------------------------------------------------------------------
+
+const METAMETHOD_DEPTH_LIMIT: usize = 200;
+
+/// Look up a binary metamethod: try left operand first, then right.
+fn get_binary_metamethod(
+    state: &VmState,
+    a: &LuaValue,
+    b: &LuaValue,
+    name: &str,
+) -> Option<LuaValue> {
+    state
+        .get_metamethod(a, name)
+        .or_else(|| state.get_metamethod(b, name))
+}
+
+/// Call a metamethod (native only for now) with given args.
+fn call_metamethod_native(
+    state: &mut VmState,
+    mm: &LuaValue,
+    args: &[LuaValue],
+) -> Result<Vec<LuaValue>, LuaError> {
+    call_function(state, mm, args)
+}
+
+/// Table __index resolution with depth limit.
+fn index_with_metamethod(
+    state: &mut VmState,
+    table_val: &LuaValue,
+    key: &LuaValue,
+    depth: usize,
+) -> Result<LuaValue, LuaError> {
+    if depth > METAMETHOD_DEPTH_LIMIT {
+        return Err(LuaError::Runtime(
+            "'__index' chain too long; possible loop".to_owned(),
+        ));
+    }
+
+    match table_val {
+        LuaValue::Table(t) => {
+            let raw = t.borrow().rawget(key);
+            if !matches!(raw, LuaValue::Nil) {
+                return Ok(raw);
+            }
+            // Check __index metamethod
+            let mm = t.borrow().get_metamethod("__index");
+            match mm {
+                Some(mm_val) => match &mm_val {
+                    LuaValue::Function(_) => {
+                        let results = call_metamethod_native(
+                            state,
+                            &mm_val,
+                            &[table_val.clone(), key.clone()],
+                        )?;
+                        Ok(results.into_iter().next().unwrap_or(LuaValue::Nil))
+                    }
+                    LuaValue::Table(_) => index_with_metamethod(state, &mm_val, key, depth + 1),
+                    _ => Ok(LuaValue::Nil),
+                },
+                None => Ok(LuaValue::Nil),
+            }
+        }
+        LuaValue::String(_) => {
+            // String indexing: use string metatable
+            if let Some(mm) = state.get_metamethod(table_val, "__index") {
+                match mm {
+                    LuaValue::Table(_) => index_with_metamethod(state, &mm, key, depth + 1),
+                    LuaValue::Function(_) => {
+                        let results =
+                            call_metamethod_native(state, &mm, &[table_val.clone(), key.clone()])?;
+                        Ok(results.into_iter().next().unwrap_or(LuaValue::Nil))
+                    }
+                    _ => Ok(LuaValue::Nil),
+                }
+            } else {
+                Ok(LuaValue::Nil)
+            }
+        }
+        _ => {
+            // Check for metamethod on the value
+            if let Some(mm) = state.get_metamethod(table_val, "__index") {
+                match mm {
+                    LuaValue::Table(_) => index_with_metamethod(state, &mm, key, depth + 1),
+                    LuaValue::Function(_) => {
+                        let results =
+                            call_metamethod_native(state, &mm, &[table_val.clone(), key.clone()])?;
+                        Ok(results.into_iter().next().unwrap_or(LuaValue::Nil))
+                    }
+                    _ => Err(LuaError::Type(format!(
+                        "attempt to index a {} value",
+                        table_val.type_name()
+                    ))),
+                }
+            } else {
+                Err(LuaError::Type(format!(
+                    "attempt to index a {} value",
+                    table_val.type_name()
+                )))
+            }
+        }
+    }
+}
+
+/// Table __newindex resolution with depth limit.
+fn newindex_with_metamethod(
+    state: &mut VmState,
+    table_val: &LuaValue,
+    key: &LuaValue,
+    val: &LuaValue,
+    depth: usize,
+) -> Result<(), LuaError> {
+    if depth > METAMETHOD_DEPTH_LIMIT {
+        return Err(LuaError::Runtime(
+            "'__newindex' chain too long; possible loop".to_owned(),
+        ));
+    }
+    match table_val {
+        LuaValue::Table(t) => {
+            // If key already exists, raw set directly
+            let existing = t.borrow().rawget(key);
+            if !matches!(existing, LuaValue::Nil) {
+                t.borrow_mut().rawset(key.clone(), val.clone());
+                return Ok(());
+            }
+            // Check __newindex metamethod
+            let mm = t.borrow().get_metamethod("__newindex");
+            match mm {
+                Some(mm_val) => match &mm_val {
+                    LuaValue::Function(_) => {
+                        call_metamethod_native(
+                            state,
+                            &mm_val,
+                            &[table_val.clone(), key.clone(), val.clone()],
+                        )?;
+                        Ok(())
+                    }
+                    LuaValue::Table(_) => {
+                        newindex_with_metamethod(state, &mm_val, key, val, depth + 1)
+                    }
+                    _ => {
+                        t.borrow_mut().rawset(key.clone(), val.clone());
+                        Ok(())
+                    }
+                },
+                None => {
+                    t.borrow_mut().rawset(key.clone(), val.clone());
+                    Ok(())
+                }
+            }
+        }
+        _ => Err(LuaError::Type(format!(
+            "attempt to index a {} value",
+            table_val.type_name()
+        ))),
     }
 }
 
@@ -200,7 +417,6 @@ pub fn execute_closure(
     let base = state.stack.len();
     let proto = &closure.proto;
 
-    // Push args onto stack, fill with nil if needed
     let max_stack = proto.max_stack_size as usize;
     state.ensure_stack(base + max_stack.max(proto.num_params as usize + 1));
 
@@ -209,7 +425,6 @@ pub fn execute_closure(
         state.set_reg(base, i as u8, val);
     }
 
-    // Collect varargs (extra arguments beyond num_params)
     let varargs = if proto.is_vararg {
         args.get(proto.num_params as usize..)
             .unwrap_or(&[])
@@ -222,13 +437,12 @@ pub fn execute_closure(
         closure: closure.clone(),
         pc: 0,
         base,
-        num_results: -1, // top-level: variable
+        num_results: -1,
         varargs,
     });
 
     let result = run_loop(state);
 
-    // Clean up: close upvalues for this frame and truncate stack
     state.close_upvalues(base);
     state.stack.truncate(base);
     state.frames.pop();
@@ -280,7 +494,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 state.set_reg(base, a, LuaValue::Boolean(b != 0));
                 if c != 0 {
-                    state.frames.last_mut().unwrap().pc += 1; // skip next
+                    state.frames.last_mut().unwrap().pc += 1;
                 }
             }
 
@@ -314,18 +528,8 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let table = state.get_reg(base, b as u8).clone();
                 let key = state.rk(base, &proto, c);
-                match table {
-                    LuaValue::Table(t) => {
-                        let val = t.borrow().rawget(&key);
-                        state.set_reg(base, a, val);
-                    }
-                    _ => {
-                        return Err(LuaError::Type(format!(
-                            "attempt to index a {} value",
-                            table.type_name()
-                        )));
-                    }
-                }
+                let val = index_with_metamethod(state, &table, &key, 0)?;
+                state.set_reg(base, a, val);
             }
 
             Opcode::SetGlobal => {
@@ -350,22 +554,13 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let table = state.get_reg(base, a).clone();
                 let key = state.rk(base, &proto, b);
                 let val = state.rk(base, &proto, c);
-                match table {
-                    LuaValue::Table(t) => {
-                        t.borrow_mut().rawset(key, val);
-                    }
-                    _ => {
-                        return Err(LuaError::Type(format!(
-                            "attempt to index a {} value",
-                            table.type_name()
-                        )));
-                    }
-                }
+                newindex_with_metamethod(state, &table, &key, &val, 0)?;
             }
 
             Opcode::NewTable => {
                 let table = Rc::new(RefCell::new(LuaTable::new()));
                 state.set_reg(base, a, LuaValue::Table(table));
+                state.notify_alloc();
             }
 
             Opcode::OpSelf => {
@@ -375,18 +570,8 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let key = state.rk(base, &proto, c);
                 // R(A+1) = R(B); R(A) = R(B)[RK(C)]
                 state.set_reg(base, a + 1, table.clone());
-                match table {
-                    LuaValue::Table(t) => {
-                        let val = t.borrow().rawget(&key);
-                        state.set_reg(base, a, val);
-                    }
-                    _ => {
-                        return Err(LuaError::Type(format!(
-                            "attempt to index a {} value",
-                            table.type_name()
-                        )));
-                    }
-                }
+                let val = index_with_metamethod(state, &table, &key, 0)?;
+                state.set_reg(base, a, val);
             }
 
             Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod | Opcode::Pow => {
@@ -394,32 +579,72 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let lhs = state.rk(base, &proto, b);
                 let rhs = state.rk(base, &proto, c);
-                let ln = to_number(&lhs)?;
-                let rn = to_number(&rhs)?;
-                let result = match op {
-                    Opcode::Add => ln + rn,
-                    Opcode::Sub => ln - rn,
-                    Opcode::Mul => ln * rn,
-                    Opcode::Div => ln / rn,
-                    Opcode::Mod => {
-                        let r = ln % rn;
-                        if r != 0.0 && (r < 0.0) != (rn < 0.0) {
-                            r + rn
-                        } else {
-                            r
+
+                // Try numeric operation first
+                let ln = lhs.to_number();
+                let rn = rhs.to_number();
+
+                if let (Some(ln), Some(rn)) = (ln, rn) {
+                    let result = match op {
+                        Opcode::Add => ln + rn,
+                        Opcode::Sub => ln - rn,
+                        Opcode::Mul => ln * rn,
+                        Opcode::Div => ln / rn,
+                        Opcode::Mod => {
+                            let r = ln % rn;
+                            if r != 0.0 && (r < 0.0) != (rn < 0.0) {
+                                r + rn
+                            } else {
+                                r
+                            }
                         }
+                        Opcode::Pow => ln.powf(rn),
+                        _ => unreachable!(),
+                    };
+                    state.set_reg(base, a, LuaValue::Number(result));
+                } else {
+                    // Try metamethods
+                    let mm_name = match op {
+                        Opcode::Add => "__add",
+                        Opcode::Sub => "__sub",
+                        Opcode::Mul => "__mul",
+                        Opcode::Div => "__div",
+                        Opcode::Mod => "__mod",
+                        Opcode::Pow => "__pow",
+                        _ => unreachable!(),
+                    };
+                    if let Some(mm) = get_binary_metamethod(state, &lhs, &rhs, mm_name) {
+                        let results = call_metamethod_native(state, &mm, &[lhs, rhs])?;
+                        let val = results.into_iter().next().unwrap_or(LuaValue::Nil);
+                        state.set_reg(base, a, val);
+                    } else {
+                        return Err(LuaError::Arithmetic(format!(
+                            "attempt to perform arithmetic on a {} value",
+                            if ln.is_none() {
+                                lhs.type_name()
+                            } else {
+                                rhs.type_name()
+                            }
+                        )));
                     }
-                    Opcode::Pow => ln.powf(rn),
-                    _ => unreachable!(),
-                };
-                state.set_reg(base, a, LuaValue::Number(result));
+                }
             }
 
             Opcode::Unm => {
                 let b = instr.b();
                 let val = state.get_reg(base, b as u8).clone();
-                let n = to_number(&val)?;
-                state.set_reg(base, a, LuaValue::Number(-n));
+                if let Some(n) = val.to_number() {
+                    state.set_reg(base, a, LuaValue::Number(-n));
+                } else if let Some(mm) = state.get_metamethod(&val, "__unm") {
+                    let results = call_metamethod_native(state, &mm, &[val])?;
+                    let r = results.into_iter().next().unwrap_or(LuaValue::Nil);
+                    state.set_reg(base, a, r);
+                } else {
+                    return Err(LuaError::Arithmetic(format!(
+                        "attempt to perform arithmetic on a {} value",
+                        val.type_name()
+                    )));
+                }
             }
 
             Opcode::Not => {
@@ -431,18 +656,25 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             Opcode::Len => {
                 let b = instr.b();
                 let val = state.get_reg(base, b as u8).clone();
-                match val {
-                    LuaValue::String(s) => {
-                        state.set_reg(base, a, LuaValue::Number(s.len() as f64));
-                    }
-                    LuaValue::Table(t) => {
-                        state.set_reg(base, a, LuaValue::Number(t.borrow().len() as f64));
-                    }
-                    _ => {
-                        return Err(LuaError::Type(format!(
-                            "attempt to get length of a {} value",
-                            val.type_name()
-                        )));
+                // Check __len metamethod first for tables
+                if let Some(mm) = state.get_metamethod(&val, "__len") {
+                    let results = call_metamethod_native(state, &mm, &[val])?;
+                    let r = results.into_iter().next().unwrap_or(LuaValue::Nil);
+                    state.set_reg(base, a, r);
+                } else {
+                    match val {
+                        LuaValue::String(s) => {
+                            state.set_reg(base, a, LuaValue::Number(s.len() as f64));
+                        }
+                        LuaValue::Table(t) => {
+                            state.set_reg(base, a, LuaValue::Number(t.borrow().len() as f64));
+                        }
+                        _ => {
+                            return Err(LuaError::Type(format!(
+                                "attempt to get length of a {} value",
+                                val.type_name()
+                            )));
+                        }
                     }
                 }
             }
@@ -451,12 +683,45 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let b = instr.b() as u8;
                 let c = instr.c() as u8;
                 let mut result = String::new();
+                let mut need_metamethod = false;
                 for i in b..=c {
                     let val = state.get_reg(base, i).clone();
                     match &val {
                         LuaValue::String(s) => result.push_str(s),
                         LuaValue::Number(_) => result.push_str(&val.to_lua_string()),
                         _ => {
+                            // Try __concat metamethod
+                            if i > b {
+                                let prev = LuaValue::from(result.clone());
+                                if let Some(mm) =
+                                    get_binary_metamethod(state, &prev, &val, "__concat")
+                                {
+                                    let mut combined = prev;
+                                    // Concat remaining with metamethod
+                                    for j in i..=c {
+                                        let next = state.get_reg(base, j).clone();
+                                        let results =
+                                            call_metamethod_native(state, &mm, &[combined, next])?;
+                                        combined =
+                                            results.into_iter().next().unwrap_or(LuaValue::Nil);
+                                    }
+                                    state.set_reg(base, a, combined);
+                                    need_metamethod = true;
+                                    break;
+                                }
+                            }
+                            if let Some(mm) = state.get_metamethod(&val, "__concat") {
+                                let prev = if result.is_empty() {
+                                    val.clone()
+                                } else {
+                                    LuaValue::from(result.clone())
+                                };
+                                let results = call_metamethod_native(state, &mm, &[prev, val])?;
+                                let r = results.into_iter().next().unwrap_or(LuaValue::Nil);
+                                state.set_reg(base, a, r);
+                                need_metamethod = true;
+                                break;
+                            }
                             return Err(LuaError::Type(format!(
                                 "attempt to concatenate a {} value",
                                 val.type_name()
@@ -464,13 +729,20 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                         }
                     }
                 }
-                state.set_reg(base, a, LuaValue::from(result));
+                if !need_metamethod {
+                    state.notify_alloc(); // String allocation from concatenation
+                    state.set_reg(base, a, LuaValue::from(result));
+                }
             }
 
             Opcode::Jmp => {
                 let sbx = instr.sbx();
                 let new_pc = (state.frames.last().unwrap().pc as i32 + sbx) as usize;
                 state.frames.last_mut().unwrap().pc = new_pc;
+                // GC safepoint at backward jumps (loop back-edges)
+                if sbx < 0 && state.gc.alloc_count() >= state.gc.threshold() {
+                    state.run_gc();
+                }
             }
 
             Opcode::Eq => {
@@ -478,10 +750,9 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let lhs = state.rk(base, &proto, b);
                 let rhs = state.rk(base, &proto, c);
-                let equal = lua_equal(&lhs, &rhs);
-                let expected = a != 0; // A=1 means skip if equal, A=0 means skip if not equal
+                let equal = lua_equal_with_metamethod(state, &lhs, &rhs)?;
+                let expected = a != 0;
                 if equal == expected {
-                    // condition met: skip next instruction
                     state.frames.last_mut().unwrap().pc += 1;
                 }
             }
@@ -491,7 +762,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let lhs = state.rk(base, &proto, b);
                 let rhs = state.rk(base, &proto, c);
-                let result = lua_less_than(&lhs, &rhs)?;
+                let result = lua_less_than_with_metamethod(state, &lhs, &rhs)?;
                 let expected = a != 0;
                 if result == expected {
                     state.frames.last_mut().unwrap().pc += 1;
@@ -503,7 +774,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let lhs = state.rk(base, &proto, b);
                 let rhs = state.rk(base, &proto, c);
-                let result = lua_less_equal(&lhs, &rhs)?;
+                let result = lua_less_equal_with_metamethod(state, &lhs, &rhs)?;
                 let expected = a != 0;
                 if result == expected {
                     state.frames.last_mut().unwrap().pc += 1;
@@ -513,7 +784,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             Opcode::Test => {
                 let c = instr.c();
                 let val = state.get_reg(base, a).clone();
-                // If (bool(val) != C) then skip next instruction
                 if val.is_truthy() != (c != 0) {
                     state.frames.last_mut().unwrap().pc += 1;
                 }
@@ -535,8 +805,12 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let c = instr.c();
                 let func_val = state.get_reg(base, a).clone();
 
+                // GC safepoint at function calls
+                if state.gc.alloc_count() >= state.gc.threshold() {
+                    state.run_gc();
+                }
+
                 let num_args = if b == 0 {
-                    // Variable args: everything from a+1 to top
                     state.stack.len() - (base + a as usize + 1)
                 } else {
                     (b - 1) as usize
@@ -546,14 +820,12 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     .map(|i| state.get_reg(base, a + 1 + i as u8).clone())
                     .collect();
 
-                let num_results_wanted = if c == 0 {
-                    -1i32 // variable
-                } else {
-                    (c - 1) as i32
-                };
+                let num_results_wanted = if c == 0 { -1i32 } else { (c - 1) as i32 };
 
-                // Special handling for pcall
+                // Special handling for pcall, xpcall, and error (source location)
                 let is_pcall = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "pcall", .. }));
+                let is_xpcall = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "xpcall", .. }));
+                let is_error = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "error", .. }));
 
                 let results = if is_pcall {
                     if args.is_empty() {
@@ -569,26 +841,70 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                             res
                         }
                         Err(e) => {
-                            let msg = match e {
-                                LuaError::Runtime(s) => LuaValue::from(s),
-                                LuaError::Type(s) => LuaValue::from(s),
-                                LuaError::Arithmetic(s) => LuaValue::from(s),
-                            };
+                            let msg = lua_error_to_value(e);
                             vec![LuaValue::Boolean(false), msg]
                         }
                     }
+                } else if is_xpcall {
+                    if args.len() < 2 {
+                        return Err(LuaError::Runtime(
+                            "bad argument #1 to 'xpcall' (value expected)".to_owned(),
+                        ));
+                    }
+                    let xpcall_func = args[0].clone();
+                    let handler = args[1].clone();
+                    let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
+                    match call_function(state, &xpcall_func, xpcall_args) {
+                        Ok(mut res) => {
+                            res.insert(0, LuaValue::Boolean(true));
+                            res
+                        }
+                        Err(e) => {
+                            let err_val = lua_error_to_value(e);
+                            // Call handler with error
+                            match call_function(state, &handler, std::slice::from_ref(&err_val)) {
+                                Ok(mut res) => {
+                                    res.insert(0, LuaValue::Boolean(false));
+                                    res
+                                }
+                                Err(handler_err) => {
+                                    let msg = lua_error_to_value(handler_err);
+                                    vec![LuaValue::Boolean(false), msg]
+                                }
+                            }
+                        }
+                    }
+                } else if is_error {
+                    // Intercept error() to prepend source location to string messages
+                    // Lua 5.1: error(msg, level) — if msg is a string and level != 0,
+                    // the source location is prepended at error() call time
+                    let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
+                    let level = args
+                        .get(1)
+                        .and_then(|v| v.to_number())
+                        .unwrap_or(1.0) as i32;
+
+                    let annotated_msg = if level > 0 {
+                        if let LuaValue::String(ref s) = msg {
+                            let loc = state.source_location();
+                            LuaValue::String(std::rc::Rc::new(format!("{loc}: {s}")))
+                        } else {
+                            msg
+                        }
+                    } else {
+                        msg
+                    };
+
+                    return Err(LuaError::Runtime(annotated_msg.to_lua_string()));
                 } else {
                     call_function(state, &func_val, &args)?
                 };
 
-                // Place results starting at R(A)
                 let num_results = results.len();
                 if num_results_wanted < 0 {
-                    // Variable: push all results
                     for (i, val) in results.into_iter().enumerate() {
                         state.set_reg(base, a + i as u8, val);
                     }
-                    // Set stack top
                     state.stack.truncate(base + a as usize + num_results);
                 } else {
                     for i in 0..num_results_wanted as usize {
@@ -602,6 +918,11 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let b = instr.b();
                 let func_val = state.get_reg(base, a).clone();
 
+                // GC safepoint at tail calls
+                if state.gc.alloc_count() >= state.gc.threshold() {
+                    state.run_gc();
+                }
+
                 let num_args = if b == 0 {
                     state.stack.len() - (base + a as usize + 1)
                 } else {
@@ -612,15 +933,139 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     .map(|i| state.get_reg(base, a + 1 + i as u8).clone())
                     .collect();
 
-                // For M1, implement as a regular call
-                let results = call_function(state, &func_val, &args)?;
-                return Ok(results);
+                // Tail call optimization: if calling a Lua closure, reuse current frame
+                match &func_val {
+                    LuaValue::Function(f) => match f.as_ref() {
+                        LuaFunction::Lua(closure) => {
+                            let new_proto = &closure.proto;
+                            state.close_upvalues(base);
+
+                            // Set up params in current frame's registers
+                            for i in 0..new_proto.num_params as usize {
+                                let val = args.get(i).cloned().unwrap_or(LuaValue::Nil);
+                                state.set_reg(base, i as u8, val);
+                            }
+
+                            let varargs = if new_proto.is_vararg {
+                                args.get(new_proto.num_params as usize..)
+                                    .unwrap_or(&[])
+                                    .to_vec()
+                            } else {
+                                Vec::new()
+                            };
+
+                            // Reuse the current call frame
+                            let frame = state.frames.last_mut().unwrap();
+                            frame.closure = closure.clone();
+                            frame.pc = 0;
+                            frame.varargs = varargs;
+                            // base stays the same — that's the optimization
+                            continue;
+                        }
+                        LuaFunction::Native { name, func } => {
+                            // Check for pcall/xpcall interception
+                            if *name == "pcall" {
+                                if args.is_empty() {
+                                    return Err(LuaError::Runtime(
+                                        "bad argument #1 to 'pcall' (value expected)".to_owned(),
+                                    ));
+                                }
+                                let pcall_func = args[0].clone();
+                                let pcall_args = if args.len() > 1 { &args[1..] } else { &[] };
+                                let results = match call_function(state, &pcall_func, pcall_args) {
+                                    Ok(mut res) => {
+                                        res.insert(0, LuaValue::Boolean(true));
+                                        res
+                                    }
+                                    Err(e) => {
+                                        let msg = lua_error_to_value(e);
+                                        vec![LuaValue::Boolean(false), msg]
+                                    }
+                                };
+                                return Ok(results);
+                            } else if *name == "xpcall" {
+                                if args.len() < 2 {
+                                    return Err(LuaError::Runtime(
+                                        "bad argument #1 to 'xpcall' (value expected)".to_owned(),
+                                    ));
+                                }
+                                let xpcall_func = args[0].clone();
+                                let handler = args[1].clone();
+                                let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
+                                let results = match call_function(state, &xpcall_func, xpcall_args)
+                                {
+                                    Ok(mut res) => {
+                                        res.insert(0, LuaValue::Boolean(true));
+                                        res
+                                    }
+                                    Err(e) => {
+                                        let err_val = lua_error_to_value(e);
+                                        match call_function(
+                                            state,
+                                            &handler,
+                                            std::slice::from_ref(&err_val),
+                                        ) {
+                                            Ok(mut res) => {
+                                                res.insert(0, LuaValue::Boolean(false));
+                                                res
+                                            }
+                                            Err(handler_err) => {
+                                                let msg = lua_error_to_value(handler_err);
+                                                vec![LuaValue::Boolean(false), msg]
+                                            }
+                                        }
+                                    }
+                                };
+                                return Ok(results);
+                            } else if *name == "error" {
+                                // Intercept error() to prepend source location
+                                let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
+                                let level = args
+                                    .get(1)
+                                    .and_then(|v| v.to_number())
+                                    .unwrap_or(1.0)
+                                    as i32;
+                                let annotated_msg = if level > 0 {
+                                    if let LuaValue::String(ref s) = msg {
+                                        let loc = state.source_location();
+                                        LuaValue::String(std::rc::Rc::new(format!("{loc}: {s}")))
+                                    } else {
+                                        msg
+                                    }
+                                } else {
+                                    msg
+                                };
+                                return Err(LuaError::Runtime(annotated_msg.to_lua_string()));
+                            }
+                            let results = func(&args).map_err(LuaError::Runtime)?;
+                            return Ok(results);
+                        }
+                    },
+                    LuaValue::Table(t) => {
+                        // Check __call metamethod
+                        if let Some(mm) = t.borrow().get_metamethod("__call") {
+                            let mut call_args = vec![func_val.clone()];
+                            call_args.extend(args);
+                            let results = call_function(state, &mm, &call_args)?;
+                            return Ok(results);
+                        }
+                        return Err(LuaError::Type(format!(
+                            "attempt to call a {} value",
+                            func_val.type_name()
+                        )));
+                    }
+                    _ => {
+                        return Err(LuaError::Type(format!(
+                            "attempt to call a {} value",
+                            func_val.type_name()
+                        )));
+                    }
+                }
             }
 
             Opcode::Return => {
                 let b = instr.b();
                 if b == 0 {
-                    // Return values from R(A) to top
                     let top = state.stack.len();
                     let start = base + a as usize;
                     let results: Vec<LuaValue> = if start < top {
@@ -630,10 +1075,8 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     };
                     return Ok(results);
                 } else if b == 1 {
-                    // No return values
                     return Ok(Vec::new());
                 } else {
-                    // Return B-1 values from R(A)
                     let count = (b - 1) as usize;
                     let results: Vec<LuaValue> = (0..count)
                         .map(|i| state.get_reg(base, a + i as u8).clone())
@@ -643,7 +1086,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             }
 
             Opcode::ForLoop => {
-                // R(A) += R(A+2); if R(A) <?= R(A+1) then { pc += sBx; R(A+3) = R(A) }
                 let index = to_number(&state.get_reg(base, a))?;
                 let limit = to_number(&state.get_reg(base, a + 1))?;
                 let step = to_number(&state.get_reg(base, a + 2))?;
@@ -665,7 +1107,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             }
 
             Opcode::ForPrep => {
-                // R(A) -= R(A+2); pc += sBx
                 let index = to_number(&state.get_reg(base, a))?;
                 let step = to_number(&state.get_reg(base, a + 2))?;
                 state.set_reg(base, a, LuaValue::Number(index - step));
@@ -675,7 +1116,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             }
 
             Opcode::TForLoop => {
-                // Call R(A)(R(A+1), R(A+2)); results in R(A+3)..R(A+2+C)
                 let c = instr.c() as usize;
                 let func = state.get_reg(base, a).clone();
                 let s = state.get_reg(base, a + 1).clone();
@@ -688,12 +1128,10 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     state.set_reg(base, a + 3 + i as u8, val);
                 }
 
-                // If first result is not nil, copy to control variable
                 let first = state.get_reg(base, a + 3).clone();
                 if first != LuaValue::Nil {
                     state.set_reg(base, a + 2, first);
                 } else {
-                    // Skip the JMP that follows (end loop)
                     state.frames.last_mut().unwrap().pc += 1;
                 }
             }
@@ -708,7 +1146,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     } else {
                         b as usize
                     };
-                    let offset = (c as usize - 1) * 50; // LFIELDS_PER_FLUSH
+                    let offset = (c as usize - 1) * 50;
                     for i in 1..=count {
                         let val = state.get_reg(base, a + i as u8).clone();
                         let key = LuaValue::Number((offset + i) as f64);
@@ -718,7 +1156,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             }
 
             Opcode::Close => {
-                // Close open upvalues at or above R(A)
                 state.close_upvalues(base + a as usize);
             }
 
@@ -727,14 +1164,11 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let child_proto = Rc::new(proto.prototypes[bx].clone());
                 let mut closure = Closure::new(child_proto.clone());
 
-                // Capture upvalues using shared references (open upvalues)
                 for uv_desc in &child_proto.upvalue_descs {
                     let uv_ref = if uv_desc.in_stack {
-                        // Capture from current stack — create/reuse open upvalue
                         let abs_idx = base + uv_desc.index as usize;
                         state.get_or_create_open_upvalue(abs_idx)
                     } else {
-                        // Capture from parent's upvalue
                         let parent_closure = state.frames.last().unwrap().closure.clone();
                         if (uv_desc.index as usize) < parent_closure.upvalues.len() {
                             parent_closure.upvalues[uv_desc.index as usize].clone()
@@ -747,11 +1181,10 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
 
                 let func = LuaFunction::Lua(Rc::new(closure));
                 state.set_reg(base, a, LuaValue::Function(Rc::new(func)));
+                state.notify_alloc();
             }
 
             Opcode::Vararg => {
-                // VARARG A B: load B-1 varargs into R(A), R(A+1), ...
-                // B=0 means load all
                 let b = instr.b();
                 let varargs = state.frames.last().unwrap().varargs.clone();
                 let num_varargs = varargs.len();
@@ -770,7 +1203,6 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 }
 
                 if b == 0 {
-                    // Adjust stack top for variable results
                     let new_top = base + a as usize + count;
                     state.stack.resize(new_top, LuaValue::Nil);
                 }
@@ -795,10 +1227,29 @@ fn call_function(
             LuaFunction::Native { func, .. } => func(args).map_err(LuaError::Runtime),
             LuaFunction::Lua(closure) => execute_closure(state, closure.clone(), args),
         },
+        LuaValue::Table(t) => {
+            // __call metamethod
+            if let Some(mm) = t.borrow().get_metamethod("__call") {
+                let mut call_args = vec![func_val.clone()];
+                call_args.extend_from_slice(args);
+                call_function(state, &mm, &call_args)
+            } else {
+                Err(LuaError::Type(format!(
+                    "attempt to call a {} value",
+                    func_val.type_name()
+                )))
+            }
+        }
         _ => Err(LuaError::Type(format!(
             "attempt to call a {} value",
             func_val.type_name()
         ))),
+    }
+}
+
+fn lua_error_to_value(e: LuaError) -> LuaValue {
+    match e {
+        LuaError::Runtime(s) | LuaError::Type(s) | LuaError::Arithmetic(s) => LuaValue::from(s),
     }
 }
 
@@ -815,31 +1266,81 @@ fn to_number(val: &LuaValue) -> Result<f64, LuaError> {
     })
 }
 
-fn lua_equal(a: &LuaValue, b: &LuaValue) -> bool {
-    a == b
-}
-
-fn lua_less_than(a: &LuaValue, b: &LuaValue) -> Result<bool, LuaError> {
+fn lua_equal_with_metamethod(
+    state: &mut VmState,
+    a: &LuaValue,
+    b: &LuaValue,
+) -> Result<bool, LuaError> {
+    // Raw equality first
+    if a == b {
+        return Ok(true);
+    }
+    // Only check __eq for two tables or two userdata of same type
     match (a, b) {
-        (LuaValue::Number(a), LuaValue::Number(b)) => Ok(a < b),
-        (LuaValue::String(a), LuaValue::String(b)) => Ok(a.as_str() < b.as_str()),
-        _ => Err(LuaError::Type(format!(
-            "attempt to compare {} with {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (LuaValue::Table(ta), LuaValue::Table(tb)) => {
+            if Rc::ptr_eq(ta, tb) {
+                return Ok(true);
+            }
+            // Both must have the same __eq metamethod
+            let mm_a = ta.borrow().get_metamethod("__eq");
+            if let Some(mm) = mm_a {
+                let results = call_metamethod_native(state, &mm, &[a.clone(), b.clone()])?;
+                let r = results.first().map(|v| v.is_truthy()).unwrap_or(false);
+                return Ok(r);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
-fn lua_less_equal(a: &LuaValue, b: &LuaValue) -> Result<bool, LuaError> {
+fn lua_less_than_with_metamethod(
+    state: &mut VmState,
+    a: &LuaValue,
+    b: &LuaValue,
+) -> Result<bool, LuaError> {
+    match (a, b) {
+        (LuaValue::Number(a), LuaValue::Number(b)) => Ok(a < b),
+        (LuaValue::String(a), LuaValue::String(b)) => Ok(a.as_str() < b.as_str()),
+        _ => {
+            if let Some(mm) = get_binary_metamethod(state, a, b, "__lt") {
+                let results = call_metamethod_native(state, &mm, &[a.clone(), b.clone()])?;
+                Ok(results.first().map(|v| v.is_truthy()).unwrap_or(false))
+            } else {
+                Err(LuaError::Type(format!(
+                    "attempt to compare {} with {}",
+                    a.type_name(),
+                    b.type_name()
+                )))
+            }
+        }
+    }
+}
+
+fn lua_less_equal_with_metamethod(
+    state: &mut VmState,
+    a: &LuaValue,
+    b: &LuaValue,
+) -> Result<bool, LuaError> {
     match (a, b) {
         (LuaValue::Number(a), LuaValue::Number(b)) => Ok(a <= b),
         (LuaValue::String(a), LuaValue::String(b)) => Ok(a.as_str() <= b.as_str()),
-        _ => Err(LuaError::Type(format!(
-            "attempt to compare {} with {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        _ => {
+            if let Some(mm) = get_binary_metamethod(state, a, b, "__le") {
+                let results = call_metamethod_native(state, &mm, &[a.clone(), b.clone()])?;
+                Ok(results.first().map(|v| v.is_truthy()).unwrap_or(false))
+            } else if let Some(mm) = get_binary_metamethod(state, b, a, "__lt") {
+                // Fallback: a <= b iff not (b < a)
+                let results = call_metamethod_native(state, &mm, &[b.clone(), a.clone()])?;
+                Ok(!results.first().map(|v| v.is_truthy()).unwrap_or(false))
+            } else {
+                Err(LuaError::Type(format!(
+                    "attempt to compare {} with {}",
+                    a.type_name(),
+                    b.type_name()
+                )))
+            }
+        }
     }
 }
 
@@ -880,7 +1381,6 @@ mod tests {
 
     #[test]
     fn execute_arithmetic() {
-        // R(0) = 10, R(1) = 3, R(2) = R(0) + R(1), return R(2)
         let proto = make_proto(
             vec![
                 Instruction::encode_abx(Opcode::LoadK, 0, 0),
@@ -899,9 +1399,9 @@ mod tests {
     fn execute_global_set_get() {
         let proto = make_proto(
             vec![
-                Instruction::encode_abx(Opcode::LoadK, 0, 1), // R(0) = 99
-                Instruction::encode_abx(Opcode::SetGlobal, 0, 0), // _G["x"] = R(0)
-                Instruction::encode_abx(Opcode::GetGlobal, 1, 0), // R(1) = _G["x"]
+                Instruction::encode_abx(Opcode::LoadK, 0, 1),
+                Instruction::encode_abx(Opcode::SetGlobal, 0, 0),
+                Instruction::encode_abx(Opcode::GetGlobal, 1, 0),
                 Instruction::encode_abc(Opcode::Return, 1, 2, 0),
             ],
             vec![LuaValue::from("x"), LuaValue::Number(99.0)],
@@ -913,21 +1413,16 @@ mod tests {
 
     #[test]
     fn execute_comparison() {
-        // if 1 < 2 then return true else return false
         let proto = make_proto(
             vec![
-                // LT 1 K(0) K(1) -- if 1 < 2, skip next
                 Instruction::encode_abc(
                     Opcode::Lt,
                     1,
                     Instruction::rk_constant(0),
                     Instruction::rk_constant(1),
                 ),
-                // JMP +2 (skip the true branch)
                 Instruction::encode_asbx(Opcode::Jmp, 0, 2),
-                // LoadBool R(0) true, skip next
                 Instruction::encode_abc(Opcode::LoadBool, 0, 1, 1),
-                // LoadBool R(0) false
                 Instruction::encode_abc(Opcode::LoadBool, 0, 0, 0),
                 Instruction::encode_abc(Opcode::Return, 0, 2, 0),
             ],
@@ -940,22 +1435,15 @@ mod tests {
 
     #[test]
     fn execute_for_loop() {
-        // sum = 0; for i = 1, 5 do sum = sum + i end; return sum
         let proto = make_proto(
             vec![
-                // R(0) = 0 (sum)
                 Instruction::encode_abx(Opcode::LoadK, 0, 0),
-                // R(1) = 1 (init), R(2) = 5 (limit), R(3) = 1 (step)
                 Instruction::encode_abx(Opcode::LoadK, 1, 1),
                 Instruction::encode_abx(Opcode::LoadK, 2, 2),
                 Instruction::encode_abx(Opcode::LoadK, 3, 1),
-                // FORPREP R(1) +1 (jump to FORLOOP)
                 Instruction::encode_asbx(Opcode::ForPrep, 1, 1),
-                // Body: R(0) = R(0) + R(4)
                 Instruction::encode_abc(Opcode::Add, 0, 0, 4),
-                // FORLOOP R(1) -2 (jump back to body)
                 Instruction::encode_asbx(Opcode::ForLoop, 1, -2),
-                // return R(0)
                 Instruction::encode_abc(Opcode::Return, 0, 2, 0),
             ],
             vec![
@@ -966,7 +1454,7 @@ mod tests {
         );
         let mut state = VmState::new();
         let results = execute(&mut state, proto).unwrap();
-        assert_eq!(results[0], LuaValue::Number(15.0)); // 1+2+3+4+5
+        assert_eq!(results[0], LuaValue::Number(15.0));
     }
 
     #[test]
@@ -979,11 +1467,11 @@ mod tests {
 
         let proto = make_proto(
             vec![
-                Instruction::encode_abx(Opcode::GetGlobal, 0, 0), // R(0) = _G["add"]
-                Instruction::encode_abx(Opcode::LoadK, 1, 1),     // R(1) = 10
-                Instruction::encode_abx(Opcode::LoadK, 2, 2),     // R(2) = 20
-                Instruction::encode_abc(Opcode::Call, 0, 3, 2),   // R(0) = R(0)(R(1), R(2))
-                Instruction::encode_abc(Opcode::Return, 0, 2, 0), // return R(0)
+                Instruction::encode_abx(Opcode::GetGlobal, 0, 0),
+                Instruction::encode_abx(Opcode::LoadK, 1, 1),
+                Instruction::encode_abx(Opcode::LoadK, 2, 2),
+                Instruction::encode_abc(Opcode::Call, 0, 3, 2),
+                Instruction::encode_abc(Opcode::Return, 0, 2, 0),
             ],
             vec![
                 LuaValue::from("add"),
@@ -1003,14 +1491,12 @@ mod tests {
         let proto = make_proto(
             vec![
                 Instruction::encode_abc(Opcode::NewTable, 0, 0, 0),
-                // t[1] = 42
                 Instruction::encode_abc(
                     Opcode::SetTable,
                     0,
                     Instruction::rk_constant(0),
                     Instruction::rk_constant(1),
                 ),
-                // R(1) = t[1]
                 Instruction::encode_abc(Opcode::GetTable, 1, 0, Instruction::rk_constant(0)),
                 Instruction::encode_abc(Opcode::Return, 1, 2, 0),
             ],

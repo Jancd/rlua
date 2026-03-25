@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::rc::Rc;
+
 use crate::value::LuaValue;
 
 /// Root source categories for GC scanning.
@@ -103,9 +106,11 @@ impl MarkSweepGc {
 
     /// Run a full mark-sweep collection cycle.
     ///
-    /// `root_providers` supplies the root sets to scan. In M1 this performs
-    /// the phase transitions and root enumeration but does not reclaim memory
-    /// (objects are still managed by `Rc`). M2 will add actual heap tracking.
+    /// `root_providers` supplies the root sets to scan. The collector
+    /// transitively walks table fields and closure upvalues to count all
+    /// reachable objects. Since objects are still managed by `Rc<RefCell<>>`,
+    /// the sweep phase doesn't actually free memory — `Rc` handles that.
+    /// This is a foundation for a future real GC heap.
     pub fn collect(&mut self, root_providers: &[&dyn GcRootProvider]) -> GcStats {
         // Mark phase: enumerate all roots
         self.phase = GcPhase::Mark;
@@ -116,8 +121,51 @@ impl MarkSweepGc {
 
         let root_count = roots.len();
 
-        // Sweep phase: in M1 this is a no-op since Rc manages lifetimes.
-        // M2 will iterate the heap and free unmarked objects.
+        // Transitive marking: walk table fields, closure upvalues, and function protos.
+        // Use pointer-based identity (Rc raw pointer) to avoid revisiting.
+        let mut visited_tables: HashSet<usize> = HashSet::new();
+        let mut visited_closures: HashSet<usize> = HashSet::new();
+        let mut work: Vec<LuaValue> = roots.iter().map(|r| r.value.clone()).collect();
+        let mut reachable_count: usize = 0;
+
+        while let Some(val) = work.pop() {
+            match &val {
+                LuaValue::Table(t) => {
+                    let ptr = Rc::as_ptr(t) as usize;
+                    if visited_tables.insert(ptr) {
+                        reachable_count += 1;
+                        let borrowed = t.borrow();
+                        // Walk all key-value pairs
+                        for (k, v) in borrowed.iter_pairs() {
+                            work.push(k);
+                            work.push(v);
+                        }
+                        // Walk metatable if present
+                        if let Some(mt) = borrowed.metatable() {
+                            work.push(LuaValue::Table(mt.clone()));
+                        }
+                    }
+                }
+                LuaValue::Function(f) => {
+                    let ptr = Rc::as_ptr(f) as usize;
+                    if visited_closures.insert(ptr) {
+                        reachable_count += 1;
+                        if let crate::function::LuaFunction::Lua(closure) = f.as_ref() {
+                            for uv in &closure.upvalues {
+                                work.push(uv.borrow().clone());
+                            }
+                        }
+                    }
+                }
+                LuaValue::String(_) => {
+                    reachable_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Sweep phase: in M2 this is still a no-op since Rc manages lifetimes.
+        // A future milestone will replace Rc with GC-managed heap objects.
         self.phase = GcPhase::Sweep;
 
         // Return to idle
@@ -127,6 +175,7 @@ impl MarkSweepGc {
 
         GcStats {
             roots_scanned: root_count,
+            reachable_objects: reachable_count,
             cycle: self.cycle_count,
         }
     }
@@ -143,6 +192,8 @@ impl Default for MarkSweepGc {
 pub struct GcStats {
     /// Number of root values scanned.
     pub roots_scanned: usize,
+    /// Number of unique reachable objects found during transitive marking.
+    pub reachable_objects: usize,
     /// Which cycle this was (monotonically increasing).
     pub cycle: u64,
 }

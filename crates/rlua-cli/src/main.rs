@@ -52,7 +52,7 @@ fn main() {
 }
 
 fn run_source(source: &str, name: &str) {
-    let proto = match rlua_compiler::compile_source(source) {
+    let proto = match rlua_compiler::compile_named(source, name) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("rlua: {name}: {e}");
@@ -113,11 +113,11 @@ fn run_repl() {
             trimmed.to_owned()
         };
 
-        let proto = match rlua_compiler::compile_source(&source) {
+        let proto = match rlua_compiler::compile_named(&source, "stdin") {
             Ok(p) => p,
             Err(_) => {
                 // Try original if return-prefix failed
-                match rlua_compiler::compile_source(trimmed) {
+                match rlua_compiler::compile_named(trimmed, "stdin") {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("  {e}");
