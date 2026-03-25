@@ -72,9 +72,17 @@ pub struct JitRuntime {
 
 impl JitRuntime {
     pub fn new(config: JitConfig) -> Self {
+        let availability = detect_jit_availability();
+
+        #[cfg(feature = "trace-jit")]
+        eprintln!(
+            "[trace-jit] JitRuntime init: enabled={}, availability={:?}",
+            config.enabled, availability
+        );
+
         Self {
             enabled: config.enabled,
-            availability: detect_jit_availability(),
+            availability,
         }
     }
 

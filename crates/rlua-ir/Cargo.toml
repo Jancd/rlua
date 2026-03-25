@@ -4,4 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+## Enable IR dump: prints trace IR to stderr after push operations.
+ir-dump = []
+
 [dependencies]

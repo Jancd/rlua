@@ -24,6 +24,9 @@ impl Trace {
     }
 
     pub fn push(&mut self, op: IrOp) {
+        #[cfg(feature = "ir-dump")]
+        eprintln!("[ir-dump] trace[{}]: {:?}", self.ops.len(), op);
+
         self.ops.push(op);
     }
 }

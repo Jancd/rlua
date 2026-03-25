@@ -4,5 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+## Diagnostic feature flags (inactive by default per engineering-quality-gates spec).
+## Enable execution tracing: logs each bytecode instruction as it executes.
+trace-exec = []
+
 [dependencies]
 rlua-core.workspace = true

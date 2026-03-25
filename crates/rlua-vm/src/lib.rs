@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use rlua_core::bytecode::RK_OFFSET;
 use rlua_core::function::{Closure, FunctionProto, LuaFunction, NativeFn, UpvalRef};
+use rlua_core::gc::{GcRoot, GcRootProvider, RootSource};
 use rlua_core::opcode::Opcode;
 use rlua_core::table::LuaTable;
 use rlua_core::value::LuaValue;
@@ -155,6 +156,32 @@ impl Default for VmState {
     }
 }
 
+impl GcRootProvider for VmState {
+    fn gc_roots(&self, roots: &mut Vec<GcRoot>) {
+        // Stack/register roots
+        for val in &self.stack {
+            if !matches!(val, LuaValue::Nil) {
+                roots.push(GcRoot {
+                    source: RootSource::Stack,
+                    value: val.clone(),
+                });
+            }
+        }
+        // Global table root
+        roots.push(GcRoot {
+            source: RootSource::Globals,
+            value: LuaValue::Table(self.globals.clone()),
+        });
+        // Open upvalue roots
+        for uv in self.open_upvalues.values() {
+            roots.push(GcRoot {
+                source: RootSource::OpenUpvalues,
+                value: uv.borrow().clone(),
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -223,6 +250,14 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
         let instr = proto.code[pc];
         let op = instr.opcode();
         let a = instr.a();
+
+        #[cfg(feature = "trace-exec")]
+        eprintln!(
+            "[trace-exec] pc={pc} op={:?} a={a} b={} c={}",
+            op,
+            instr.b(),
+            instr.c()
+        );
 
         // Advance PC
         state.frames.last_mut().unwrap().pc = pc + 1;
