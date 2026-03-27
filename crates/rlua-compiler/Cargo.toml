@@ -9,5 +9,6 @@ rlua-core.workspace = true
 rlua-parser.workspace = true
 
 [dev-dependencies]
+rlua-jit.workspace = true
 rlua-vm.workspace = true
 rlua-stdlib.workspace = true

@@ -8,6 +8,10 @@ use rlua_core::gc::{GcRoot, GcRootProvider, MarkSweepGc, RootSource};
 use rlua_core::opcode::Opcode;
 use rlua_core::table::{LuaTable, TableRef};
 use rlua_core::value::LuaValue;
+use rlua_ir::{IrOp, Trace, ValueType};
+use rlua_jit::{
+    ExecutionMode, JitConfig, JitRuntime, JitStats, LoopTraceRecorder, RecordingRequest, TraceKey,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -58,10 +62,36 @@ pub struct VmState {
     string_metatable: Option<TableRef>,
     /// GC instance for allocation tracking.
     gc: MarkSweepGc,
+    /// JIT runtime and cache management.
+    jit: JitRuntime,
+    /// Per-loop execution counters keyed by function and loop header pc.
+    loop_hotness: HashMap<TraceKey, u32>,
+    /// Prevent immediate re-entry into a trace right after a side exit.
+    pending_side_exit: Option<TraceKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotLoopCounter {
+    pub function: usize,
+    pub loop_header_pc: usize,
+    pub hits: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmJitDebugState {
+    pub execution_mode: ExecutionMode,
+    pub config: JitConfig,
+    pub counters: Vec<HotLoopCounter>,
+    pub stats: JitStats,
+    pub trace_count: usize,
 }
 
 impl VmState {
     pub fn new() -> Self {
+        Self::with_jit_config(JitConfig::default())
+    }
+
+    pub fn with_jit_config(config: JitConfig) -> Self {
         Self {
             stack: Vec::with_capacity(256),
             frames: Vec::new(),
@@ -70,6 +100,9 @@ impl VmState {
             open_upvalues: HashMap::new(),
             string_metatable: None,
             gc: MarkSweepGc::new(),
+            jit: JitRuntime::new(config),
+            loop_hotness: HashMap::new(),
+            pending_side_exit: None,
         }
     }
 
@@ -95,6 +128,27 @@ impl VmState {
 
     pub fn clear_output(&mut self) {
         self.output.clear();
+    }
+
+    pub fn jit_debug_state(&self) -> VmJitDebugState {
+        let mut counters: Vec<HotLoopCounter> = self
+            .loop_hotness
+            .iter()
+            .map(|(key, hits)| HotLoopCounter {
+                function: key.function,
+                loop_header_pc: key.loop_header_pc,
+                hits: *hits,
+            })
+            .collect();
+        counters.sort_by_key(|counter| (counter.function, counter.loop_header_pc));
+
+        VmJitDebugState {
+            execution_mode: self.jit.execution_mode(),
+            config: self.jit.config(),
+            counters,
+            stats: self.jit.stats(),
+            trace_count: self.jit.trace_count(),
+        }
     }
 
     fn ensure_stack(&mut self, size: usize) {
@@ -209,6 +263,63 @@ impl VmState {
         let provider = RootList(roots);
         self.gc.collect(&[&provider]);
     }
+
+    fn slot_value_type(&self, abs_idx: usize) -> ValueType {
+        if let Some(value) = self.open_upvalues.get(&abs_idx) {
+            return value_type_of(&value.borrow());
+        }
+        value_type_of(&self.stack.get(abs_idx).cloned().unwrap_or(LuaValue::Nil))
+    }
+
+    fn track_loop_hotness(&mut self, loop_header_pc: usize) {
+        if !self.jit.is_active() {
+            return;
+        }
+
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+
+        let base = frame.base;
+        let proto = frame.closure.proto.clone();
+        let key = TraceKey::new(Rc::as_ptr(&proto) as usize, loop_header_pc);
+        let hits = {
+            let counter = self.loop_hotness.entry(key).or_insert(0);
+            *counter = counter.saturating_add(1);
+            *counter
+        };
+
+        if self.jit.lookup_trace(&key).is_some() {
+            return;
+        }
+
+        if hits < self.jit.hot_threshold() {
+            return;
+        }
+
+        self.jit.note_hot_loop_trigger(key);
+
+        let max_stack = proto.max_stack_size as usize;
+        let slot_types: Vec<ValueType> = (0..max_stack)
+            .map(|idx| self.slot_value_type(base + idx))
+            .collect();
+        let request = RecordingRequest {
+            key,
+            code: &proto.code,
+            slot_types: &slot_types,
+        };
+        let mut recorder = LoopTraceRecorder;
+        if let Err(err) = self.jit.record_trace(&mut recorder, &request) {
+            #[cfg(feature = "trace-jit")]
+            eprintln!(
+                "[trace-jit] failed to record trace at function=0x{:x} loop_header_pc={}: {:?}",
+                key.function, key.loop_header_pc, err
+            );
+
+            #[cfg(not(feature = "trace-jit"))]
+            let _ = err;
+        }
+    }
 }
 
 impl Default for VmState {
@@ -256,6 +367,17 @@ fn get_binary_metamethod(
     state
         .get_metamethod(a, name)
         .or_else(|| state.get_metamethod(b, name))
+}
+
+fn value_type_of(value: &LuaValue) -> ValueType {
+    match value {
+        LuaValue::Nil => ValueType::Nil,
+        LuaValue::Boolean(_) => ValueType::Boolean,
+        LuaValue::Number(_) => ValueType::Number,
+        LuaValue::String(_) => ValueType::String,
+        LuaValue::Table(_) => ValueType::Table,
+        LuaValue::Function(_) => ValueType::Function,
+    }
 }
 
 /// Call a metamethod (native only for now) with given args.
@@ -450,6 +572,196 @@ pub fn execute_closure(
     result
 }
 
+fn maybe_run_cached_trace(
+    state: &mut VmState,
+    base: usize,
+    pc: usize,
+    proto: &Rc<FunctionProto>,
+) -> Result<bool, LuaError> {
+    if !state.jit.is_active() {
+        return Ok(false);
+    }
+
+    let key = TraceKey::new(Rc::as_ptr(proto) as usize, pc);
+
+    if let Some(pending) = state.pending_side_exit {
+        if pending == key {
+            state.pending_side_exit = None;
+            return Ok(false);
+        }
+        state.pending_side_exit = None;
+    }
+
+    let trace = {
+        let Some(trace) = state.jit.lookup_trace(&key) else {
+            return Ok(false);
+        };
+        trace.clone()
+    };
+
+    state.jit.note_replay_entry(key);
+
+    match replay_trace(state, base, proto, key, &trace)? {
+        TraceReplayResult::Completed => {
+            state.frames.last_mut().unwrap().pc = trace.exit_pc;
+        }
+        TraceReplayResult::SideExit(resume_pc) => {
+            state.jit.note_side_exit(key, resume_pc);
+            state.pending_side_exit = Some(key);
+            state.frames.last_mut().unwrap().pc = resume_pc;
+        }
+    }
+
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceReplayResult {
+    Completed,
+    SideExit(usize),
+}
+
+fn replay_trace(
+    state: &mut VmState,
+    base: usize,
+    proto: &FunctionProto,
+    key: TraceKey,
+    trace: &Trace,
+) -> Result<TraceReplayResult, LuaError> {
+    for op in &trace.ops {
+        match op {
+            IrOp::GuardType(guard) => {
+                let actual = value_type_of(&state.get_reg(base, guard.slot as u8));
+                if actual != guard.expected {
+                    return Ok(TraceReplayResult::SideExit(guard.exit.resume_pc));
+                }
+            }
+            IrOp::Instruction(recorded) => {
+                if let Some(resume_pc) = execute_replay_instruction(
+                    state,
+                    base,
+                    proto,
+                    key,
+                    recorded.pc,
+                    recorded.instruction,
+                )? {
+                    return Ok(TraceReplayResult::SideExit(resume_pc));
+                }
+            }
+        }
+    }
+
+    Ok(TraceReplayResult::Completed)
+}
+
+fn execute_replay_instruction(
+    state: &mut VmState,
+    base: usize,
+    proto: &FunctionProto,
+    key: TraceKey,
+    pc: usize,
+    instruction: rlua_core::bytecode::Instruction,
+) -> Result<Option<usize>, LuaError> {
+    let op = instruction.opcode();
+    let a = instruction.a();
+
+    match op {
+        Opcode::Move => {
+            let b = instruction.b();
+            let val = state.get_reg(base, b as u8);
+            state.set_reg(base, a, val);
+            Ok(None)
+        }
+        Opcode::LoadK => {
+            let bx = instruction.bx() as usize;
+            let val = proto.constants[bx].clone();
+            state.set_reg(base, a, val);
+            Ok(None)
+        }
+        Opcode::LoadBool => {
+            let b = instruction.b();
+            state.set_reg(base, a, LuaValue::Boolean(b != 0));
+            Ok(None)
+        }
+        Opcode::LoadNil => {
+            let b = instruction.b() as u8;
+            for i in a..=a + b {
+                state.set_reg(base, i, LuaValue::Nil);
+            }
+            Ok(None)
+        }
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod | Opcode::Pow => {
+            let lhs = state.rk(base, proto, instruction.b());
+            let rhs = state.rk(base, proto, instruction.c());
+            let (Some(ln), Some(rn)) = (lhs.to_number(), rhs.to_number()) else {
+                return Ok(Some(pc));
+            };
+
+            let result = match op {
+                Opcode::Add => ln + rn,
+                Opcode::Sub => ln - rn,
+                Opcode::Mul => ln * rn,
+                Opcode::Div => ln / rn,
+                Opcode::Mod => {
+                    let r = ln % rn;
+                    if r != 0.0 && (r < 0.0) != (rn < 0.0) {
+                        r + rn
+                    } else {
+                        r
+                    }
+                }
+                Opcode::Pow => ln.powf(rn),
+                _ => unreachable!(),
+            };
+            state.set_reg(base, a, LuaValue::Number(result));
+            Ok(None)
+        }
+        Opcode::Unm => {
+            let b = instruction.b();
+            let Some(num) = state.get_reg(base, b as u8).to_number() else {
+                return Ok(Some(pc));
+            };
+            state.set_reg(base, a, LuaValue::Number(-num));
+            Ok(None)
+        }
+        Opcode::Not => {
+            let b = instruction.b();
+            let value = state.get_reg(base, b as u8);
+            state.set_reg(base, a, LuaValue::Boolean(!value.is_truthy()));
+            Ok(None)
+        }
+        Opcode::Jmp => {
+            let target_pc = (pc as i32 + 1 + instruction.sbx()) as usize;
+            if target_pc == key.loop_header_pc {
+                Ok(None)
+            } else {
+                Ok(Some(pc))
+            }
+        }
+        Opcode::ForLoop => {
+            let index = to_number(&state.get_reg(base, a))?;
+            let limit = to_number(&state.get_reg(base, a + 1))?;
+            let step = to_number(&state.get_reg(base, a + 2))?;
+            let new_index = index + step;
+
+            let in_range = if step > 0.0 {
+                new_index <= limit
+            } else {
+                new_index >= limit
+            };
+
+            if in_range {
+                state.set_reg(base, a, LuaValue::Number(new_index));
+                state.set_reg(base, a + 3, LuaValue::Number(new_index));
+                Ok(None)
+            } else {
+                Ok(Some(pc + 1))
+            }
+        }
+        _ => Ok(Some(pc)),
+    }
+}
+
 fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
     loop {
         let frame = state.frames.last().unwrap();
@@ -459,6 +771,10 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
 
         if pc >= proto.code.len() {
             return Ok(Vec::new());
+        }
+
+        if maybe_run_cached_trace(state, base, pc, &proto)? {
+            continue;
         }
 
         let instr = proto.code[pc];
@@ -740,8 +1056,11 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                 let new_pc = (state.frames.last().unwrap().pc as i32 + sbx) as usize;
                 state.frames.last_mut().unwrap().pc = new_pc;
                 // GC safepoint at backward jumps (loop back-edges)
-                if sbx < 0 && state.gc.alloc_count() >= state.gc.threshold() {
-                    state.run_gc();
+                if sbx < 0 {
+                    state.track_loop_hotness(new_pc);
+                    if state.gc.alloc_count() >= state.gc.threshold() {
+                        state.run_gc();
+                    }
                 }
             }
 
@@ -1097,6 +1416,9 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     let sbx = instr.sbx();
                     let new_pc = (state.frames.last().unwrap().pc as i32 + sbx) as usize;
                     state.frames.last_mut().unwrap().pc = new_pc;
+                    if sbx < 0 {
+                        state.track_loop_hotness(new_pc);
+                    }
                 }
             }
 
@@ -1449,6 +1771,114 @@ mod tests {
         let mut state = VmState::new();
         let results = execute(&mut state, proto).unwrap();
         assert_eq!(results[0], LuaValue::Number(15.0));
+    }
+
+    #[test]
+    fn records_hot_loop_trace_once_threshold_is_reached() {
+        let proto = make_proto(
+            vec![
+                Instruction::encode_abx(Opcode::LoadK, 0, 0),
+                Instruction::encode_abx(Opcode::LoadK, 1, 1),
+                Instruction::encode_abx(Opcode::LoadK, 2, 2),
+                Instruction::encode_abx(Opcode::LoadK, 3, 1),
+                Instruction::encode_asbx(Opcode::ForPrep, 1, 1),
+                Instruction::encode_abc(Opcode::Add, 0, 0, 4),
+                Instruction::encode_asbx(Opcode::ForLoop, 1, -2),
+                Instruction::encode_abc(Opcode::Return, 0, 2, 0),
+            ],
+            vec![
+                LuaValue::Number(0.0),
+                LuaValue::Number(1.0),
+                LuaValue::Number(5.0),
+            ],
+        );
+
+        let mut state = VmState::with_jit_config(JitConfig {
+            hot_threshold: 2,
+            ..JitConfig::default()
+        });
+        let results = execute(&mut state, proto).unwrap();
+        let debug = state.jit_debug_state();
+
+        assert_eq!(results[0], LuaValue::Number(15.0));
+        assert_eq!(debug.trace_count, 1);
+        assert_eq!(debug.stats.hot_loop_triggers, 1);
+        assert_eq!(debug.stats.trace_installs, 1);
+        assert!(debug.stats.replay_entries >= 1);
+        assert!(
+            debug
+                .counters
+                .iter()
+                .any(|counter| counter.loop_header_pc == 5 && counter.hits >= 2)
+        );
+    }
+
+    #[test]
+    fn disabled_jit_keeps_interpreter_only_mode() {
+        let proto = make_proto(
+            vec![
+                Instruction::encode_abx(Opcode::LoadK, 0, 0),
+                Instruction::encode_abx(Opcode::LoadK, 1, 1),
+                Instruction::encode_abx(Opcode::LoadK, 2, 2),
+                Instruction::encode_abx(Opcode::LoadK, 3, 1),
+                Instruction::encode_asbx(Opcode::ForPrep, 1, 1),
+                Instruction::encode_abc(Opcode::Add, 0, 0, 4),
+                Instruction::encode_asbx(Opcode::ForLoop, 1, -2),
+                Instruction::encode_abc(Opcode::Return, 0, 2, 0),
+            ],
+            vec![
+                LuaValue::Number(0.0),
+                LuaValue::Number(1.0),
+                LuaValue::Number(5.0),
+            ],
+        );
+
+        let mut state = VmState::with_jit_config(JitConfig {
+            enabled: false,
+            hot_threshold: 1,
+        });
+        let results = execute(&mut state, proto).unwrap();
+        let debug = state.jit_debug_state();
+
+        assert_eq!(results[0], LuaValue::Number(15.0));
+        assert_eq!(debug.execution_mode, ExecutionMode::InterpreterOnly);
+        assert_eq!(debug.trace_count, 0);
+        assert_eq!(debug.stats.hot_loop_triggers, 0);
+    }
+
+    #[test]
+    fn guard_failure_side_exits_back_to_interpreter_once() {
+        let proto = Rc::new(FunctionProto {
+            code: vec![
+                Instruction::encode_abc(Opcode::Move, 0, 0, 0),
+                Instruction::encode_abc(Opcode::Return, 0, 2, 0),
+            ],
+            max_stack_size: 2,
+            num_params: 1,
+            is_vararg: false,
+            ..FunctionProto::new()
+        });
+        let closure = Rc::new(Closure::new(proto.clone()));
+        let key = TraceKey::new(Rc::as_ptr(&proto) as usize, 0);
+        let mut trace = Trace::new(key.function, 0);
+        trace.push_guard(0, ValueType::Number, 0);
+        trace.push_instruction(0, Instruction::encode_abc(Opcode::Move, 0, 0, 0));
+        trace.set_exit_pc(1);
+
+        let mut state = VmState::with_jit_config(JitConfig {
+            hot_threshold: 1,
+            ..JitConfig::default()
+        });
+        assert!(state.jit.install_trace(key, trace));
+
+        let results =
+            execute_closure(&mut state, closure, &[LuaValue::from("not-a-number")]).unwrap();
+        let debug = state.jit_debug_state();
+
+        assert_eq!(results, vec![LuaValue::from("not-a-number")]);
+        assert_eq!(debug.stats.replay_entries, 1);
+        assert_eq!(debug.stats.side_exits, 1);
+        assert_eq!(debug.trace_count, 1);
     }
 
     #[test]

@@ -7,6 +7,7 @@ name = "rlua-cli"
 version = "0.1.0"
 dependencies = [
  "rlua-compiler",
+ "rlua-jit",
  "rlua-stdlib",
  "rlua-vm",
 ]
@@ -16,6 +17,7 @@ name = "rlua-compiler"
 version = "0.1.0"
 dependencies = [
  "rlua-core",
+ "rlua-jit",
  "rlua-parser",
  "rlua-stdlib",
  "rlua-vm",
@@ -28,11 +30,15 @@ version = "0.1.0"
 [[package]]
 name = "rlua-ir"
 version = "0.1.0"
+dependencies = [
+ "rlua-core",
+]
 
 [[package]]
 name = "rlua-jit"
 version = "0.1.0"
 dependencies = [
+ "rlua-core",
  "rlua-ir",
 ]
 
@@ -53,4 +59,6 @@ name = "rlua-vm"
 version = "0.1.0"
 dependencies = [
  "rlua-core",
+ "rlua-ir",
+ "rlua-jit",
 ]

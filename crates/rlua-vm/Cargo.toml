@@ -8,6 +8,10 @@ license.workspace = true
 ## Diagnostic feature flags (inactive by default per engineering-quality-gates spec).
 ## Enable execution tracing: logs each bytecode instruction as it executes.
 trace-exec = []
+## Forward JIT tracing to the runtime recorder/cache layer.
+trace-jit = ["rlua-jit/trace-jit"]
 
 [dependencies]
 rlua-core.workspace = true
+rlua-ir.workspace = true
+rlua-jit.workspace = true
