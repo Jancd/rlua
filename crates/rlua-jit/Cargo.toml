@@ -9,7 +9,8 @@ license.workspace = true
 ## Enable JIT pipeline tracing: logs hot loop detection, trace recording, compilation.
 trace-jit = []
 ## Enable IR dump: prints IR trace contents after recording/optimization.
-ir-dump = []
+ir-dump = ["rlua-ir/ir-dump"]
 
 [dependencies]
+rlua-core.workspace = true
 rlua-ir.workspace = true

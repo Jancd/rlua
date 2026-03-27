@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 rlua-compiler.workspace = true
+rlua-jit.workspace = true
 rlua-vm.workspace = true
 rlua-stdlib.workspace = true
