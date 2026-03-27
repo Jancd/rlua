@@ -74,6 +74,8 @@ struct FuncState {
     grandparent_locals: Vec<(String, u8)>,
     /// Grandparent function's upvalues (for 3+ level upvalue resolution).
     grandparent_upvalues: Vec<(String, u8)>,
+    /// Current source line being compiled — written into line_info for each emitted instruction.
+    current_line: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -104,13 +106,14 @@ impl FuncState {
             enclosing_upvalues: Vec::new(),
             grandparent_locals: Vec::new(),
             grandparent_upvalues: Vec::new(),
+            current_line: 0,
         }
     }
 
     fn emit(&mut self, instr: Instruction) -> usize {
         let pc = self.proto.code.len();
         self.proto.code.push(instr);
-        self.proto.line_info.push(0); // line info placeholder
+        self.proto.line_info.push(self.current_line);
         pc
     }
 
@@ -391,10 +394,12 @@ impl<'src> Compiler<'src> {
     // -- Block & Statements --
 
     fn compile_block(&mut self, fs: &mut FuncState, block: &Block) -> Result<(), CompileError> {
-        for stmt in &block.stmts {
-            self.compile_stmt(fs, stmt)?;
+        for spanned in &block.stmts {
+            fs.current_line = spanned.line;
+            self.compile_stmt(fs, &spanned.stmt)?;
         }
         if let Some(ref ret_exprs) = block.ret {
+            fs.current_line = block.ret_line;
             self.compile_return(fs, ret_exprs)?;
         }
         Ok(())

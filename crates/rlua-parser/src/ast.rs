@@ -2,8 +2,17 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
-    pub stmts: Vec<Stmt>,
+    pub stmts: Vec<SpannedStmt>,
     pub ret: Option<Vec<Expr>>,
+    /// Line number of the return statement, if present.
+    pub ret_line: u32,
+}
+
+/// A statement annotated with its source line number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpannedStmt {
+    pub stmt: Stmt,
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

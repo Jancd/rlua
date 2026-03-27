@@ -83,6 +83,7 @@ impl<'src> Parser<'src> {
     pub fn parse_block(&mut self) -> Result<Block, ParseError> {
         let mut stmts = Vec::new();
         let mut ret = None;
+        let mut ret_line = 0u32;
 
         loop {
             // Skip semicolons
@@ -93,6 +94,7 @@ impl<'src> Parser<'src> {
             }
 
             if self.check(&TokenKind::Return) {
+                ret_line = self.line;
                 self.advance()?;
                 let values = if self.is_block_end() || self.check(&TokenKind::Semicolon) {
                     Vec::new()
@@ -104,10 +106,16 @@ impl<'src> Parser<'src> {
                 break;
             }
 
-            stmts.push(self.parse_statement()?);
+            let line = self.line;
+            let stmt = self.parse_statement()?;
+            stmts.push(SpannedStmt { stmt, line });
         }
 
-        Ok(Block { stmts, ret })
+        Ok(Block {
+            stmts,
+            ret,
+            ret_line,
+        })
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
@@ -666,7 +674,7 @@ mod tests {
     fn parse_local_assign() {
         let block = parse_block("local x = 1");
         assert_eq!(block.stmts.len(), 1);
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::LocalAssign { names, values } => {
                 assert_eq!(names, &["x"]);
                 assert_eq!(values.len(), 1);
@@ -679,7 +687,7 @@ mod tests {
     #[test]
     fn parse_assignment() {
         let block = parse_block("x = x + 1");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::Assign { targets, values } => {
                 assert_eq!(targets.len(), 1);
                 assert_eq!(values.len(), 1);
@@ -691,7 +699,7 @@ mod tests {
     #[test]
     fn parse_if_statement() {
         let block = parse_block("if x then y() end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::If {
                 condition,
                 then_body,
@@ -710,11 +718,11 @@ mod tests {
     #[test]
     fn parse_while_loop() {
         let block = parse_block("while true do break end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::While { condition, body } => {
                 assert_eq!(*condition, Expr::True);
                 assert_eq!(body.stmts.len(), 1);
-                assert!(matches!(body.stmts[0], Stmt::Break));
+                assert!(matches!(body.stmts[0].stmt, Stmt::Break));
             }
             _ => panic!("expected While"),
         }
@@ -723,7 +731,7 @@ mod tests {
     #[test]
     fn parse_numeric_for() {
         let block = parse_block("for i = 1, 10 do end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::NumericFor {
                 name,
                 start,
@@ -743,7 +751,7 @@ mod tests {
     #[test]
     fn parse_generic_for() {
         let block = parse_block("for k, v in pairs(t) do end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::GenericFor { names, .. } => {
                 assert_eq!(names, &["k", "v"]);
             }
@@ -754,7 +762,7 @@ mod tests {
     #[test]
     fn parse_function_def() {
         let block = parse_block("function f(a, b) return a + b end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::FunctionDef { name, params, .. } => {
                 assert_eq!(name.parts, vec!["f"]);
                 assert_eq!(params, &["a", "b"]);
@@ -766,7 +774,7 @@ mod tests {
     #[test]
     fn parse_local_function() {
         let block = parse_block("local function f() end");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::LocalFunction { name, .. } => {
                 assert_eq!(name, "f");
             }
@@ -833,7 +841,7 @@ mod tests {
     #[test]
     fn parse_method_call() {
         let block = parse_block("a:b(c)");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::MethodCall { method, args, .. } => {
                 assert_eq!(method, "b");
                 assert_eq!(args.len(), 1);
@@ -845,7 +853,7 @@ mod tests {
     #[test]
     fn parse_repeat_until() {
         let block = parse_block("repeat x = 1 until true");
-        match &block.stmts[0] {
+        match &block.stmts[0].stmt {
             Stmt::Repeat { condition, .. } => {
                 assert_eq!(*condition, Expr::True);
             }
