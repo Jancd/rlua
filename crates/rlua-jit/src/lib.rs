@@ -3,7 +3,7 @@ mod x86_64;
 
 use core::fmt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use executable::ExecutableBuffer;
 use rlua_core::bytecode::Instruction;
@@ -132,7 +132,7 @@ pub struct TraceCacheDebugEntry {
 pub struct CachedTraceHandle {
     pub trace: Trace,
     pub optimized: OptimizedTrace,
-    pub native: Option<Arc<NativeTraceArtifact>>,
+    pub native: Option<Rc<NativeTraceArtifact>>,
     pub native_state: NativeArtifactState,
 }
 
@@ -268,7 +268,7 @@ impl TraceRecorder for LoopTraceRecorder {
 struct CachedTrace {
     trace: Trace,
     optimized: OptimizedTrace,
-    native: Option<Arc<NativeTraceArtifact>>,
+    native: Option<Rc<NativeTraceArtifact>>,
     native_state: NativeArtifactState,
     native_entries: u64,
 }
@@ -515,7 +515,7 @@ impl JitRuntime {
     fn prepare_native_artifact(
         &mut self,
         optimized: &OptimizedTrace,
-    ) -> (Option<Arc<NativeTraceArtifact>>, NativeArtifactState) {
+    ) -> (Option<Rc<NativeTraceArtifact>>, NativeArtifactState) {
         self.stats.native_compile_attempts += 1;
 
         if self.availability != JitAvailability::Available {
@@ -547,10 +547,7 @@ impl JitRuntime {
         match NativeTraceArtifact::install(encoded) {
             Ok(artifact) => {
                 self.stats.native_compile_installs += 1;
-                (
-                    Some(Arc::<NativeTraceArtifact>::new(artifact)),
-                    NativeArtifactState::Installed,
-                )
+                (Some(Rc::new(artifact)), NativeArtifactState::Installed)
             }
             Err(err) => {
                 self.stats.native_failures += 1;
