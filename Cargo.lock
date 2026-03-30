@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "rlua-compiler",
  "rlua-core",
+ "rlua-ir",
  "rlua-jit",
  "rlua-stdlib",
  "rlua-vm",

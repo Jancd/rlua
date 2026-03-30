@@ -29,12 +29,29 @@ struct BenchResult {
     debug: rlua_vm::VmJitDebugState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseStatus {
+    Pass,
+    Investigate,
+    Fail,
+}
+
+impl ReleaseStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Investigate => "investigate",
+            Self::Fail => "fail",
+        }
+    }
+}
+
 fn main() {
     let options = parse_args(std::env::args().skip(1).collect())
         .unwrap_or_else(|err| abort(&format!("jit-bench: {err}")));
     let cases = load_cases(&options.workloads);
 
-    println!("M5 JIT benchmark harness");
+    println!("M6 JIT benchmark harness");
     println!(
         "workloads={} samples={} hot_threshold={} side_exit_threshold={}",
         cases.len(),
@@ -109,7 +126,20 @@ fn main() {
         println!("target status: below target (< {:.1}x)", TARGET_SPEEDUP);
     }
 
-    for result in &results {
+    let slow_cases: Vec<&BenchResult> = results
+        .iter()
+        .filter(|result| result.speedup < TARGET_SPEEDUP)
+        .collect();
+    let release_status = if median_speedup < TARGET_SPEEDUP {
+        ReleaseStatus::Fail
+    } else if slow_cases.is_empty() {
+        ReleaseStatus::Pass
+    } else {
+        ReleaseStatus::Investigate
+    };
+    println!("release status: {}", release_status.as_str());
+
+    for result in slow_cases {
         if result.speedup < TARGET_SPEEDUP {
             println!(
                 "slow case: {} interp={:.3}ms jit={:.3}ms speedup={:.2}x {}",
@@ -264,8 +294,11 @@ fn run_case(proto: &FunctionProto, config: JitConfig) -> (Duration, rlua_vm::VmJ
 fn format_debug_summary(debug: &rlua_vm::VmJitDebugState) -> String {
     if debug.traces.is_empty() {
         return format!(
-            "traces=0 native={} replay={} exits={}",
-            debug.stats.native_entries, debug.stats.replay_entries, debug.stats.side_exits
+            "traces=0 native={} replay={} exits={} invalidated_bypasses={}",
+            debug.stats.native_entries,
+            debug.stats.replay_entries,
+            debug.stats.side_exits,
+            debug.stats.invalidated_bypasses
         );
     }
 
@@ -283,19 +316,27 @@ fn format_debug_summary(debug: &rlua_vm::VmJitDebugState) -> String {
                 .map(|reason| format!("{reason:?}"))
                 .unwrap_or_else(|| "none".to_string());
             format!(
-                "g{}:{}/{}:{}",
-                trace.generation, lifecycle, trace.native_state as u8, invalidation
+                "g{}:{}/{}:{}:replay={}:native={}:exits={}:invalidated_bypasses={}",
+                trace.generation,
+                lifecycle,
+                trace.native_state as u8,
+                invalidation,
+                trace.replay_entries,
+                trace.native_entries,
+                trace.side_exit_count,
+                trace.invalidated_bypasses
             )
         })
         .collect::<Vec<_>>()
         .join(",");
 
     format!(
-        "traces={} native={} replay={} exits={} states=[{}]",
+        "traces={} native={} replay={} exits={} invalidated_bypasses={} states=[{}]",
         debug.trace_count,
         debug.stats.native_entries,
         debug.stats.replay_entries,
         debug.stats.side_exits,
+        debug.stats.invalidated_bypasses,
         states
     )
 }

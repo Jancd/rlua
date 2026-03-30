@@ -153,6 +153,28 @@ fn assert_has_side_exit_deopt(name: &str, jit_debug: &rlua_vm::VmJitDebugState) 
     );
 }
 
+fn assert_trace_debug_is_observable(name: &str, jit_debug: &rlua_vm::VmJitDebugState) {
+    assert!(
+        jit_debug.trace_count >= 1,
+        "expected cached trace debug state for {name}"
+    );
+    assert_eq!(jit_debug.traces.len(), jit_debug.trace_count);
+    assert!(
+        jit_debug.stats.replay_entries + jit_debug.stats.native_entries >= 1,
+        "expected trace activity counters for {name}"
+    );
+    assert!(
+        jit_debug.traces.iter().any(|trace| {
+            trace.last_execution != rlua_jit::TraceExecutionState::None
+                || trace.replay_entries > 0
+                || trace.native_entries > 0
+                || trace.side_exit_count > 0
+                || trace.invalidated_bypasses > 0
+        }),
+        "expected trace execution metadata for {name}"
+    );
+}
+
 #[test]
 fn jit_numeric_sum_matches_interpreter() {
     assert_jit_matches_interpreter("numeric_sum.lua");
@@ -178,6 +200,7 @@ fn jit_native_side_exit_resume_matches_interpreter() {
     assert_eq!(jit_results, interp_results);
     assert_eq!(jit_output, interp_output);
     assert_supported_trace_backend_state("native_side_exit_resume.lua");
+    assert_trace_debug_is_observable("native_side_exit_resume.lua", &jit_debug);
     assert!(jit_debug.stats.side_exits >= 1);
     assert_has_side_exit_deopt("native_side_exit_resume.lua", &jit_debug);
 }
@@ -190,6 +213,7 @@ fn jit_guard_exit_resumes_without_drift() {
     assert_eq!(jit_results, interp_results);
     assert_eq!(jit_output, interp_output);
     assert_supported_trace_backend_state("guard_string_seed.lua");
+    assert_trace_debug_is_observable("guard_string_seed.lua", &jit_debug);
     assert!(jit_debug.stats.side_exits >= 1);
     assert_has_guard_deopt("guard_string_seed.lua", &jit_debug);
 }
@@ -207,11 +231,15 @@ fn jit_invalidated_trace_can_recompile_without_drift() {
 
     assert_eq!(jit_results, interp_results);
     assert_eq!(jit_output, interp_output);
+    assert_trace_debug_is_observable("guard_invalidation_recovery.lua", &jit_debug);
     assert!(jit_debug.stats.side_exits >= 2);
     assert!(jit_debug.stats.trace_invalidations >= 1);
     assert!(jit_debug.stats.trace_recompiles >= 1);
-    assert!(
-        jit_debug.traces.iter().any(|trace| trace.generation >= 1),
-        "expected a replacement trace generation after invalidation"
-    );
+    let replacement = jit_debug
+        .traces
+        .iter()
+        .find(|trace| trace.generation >= 1)
+        .expect("expected a replacement trace generation after invalidation");
+    assert!(replacement.side_exit_count <= u64::from(config.side_exit_threshold));
+    assert!(replacement.replay_entries + replacement.native_entries >= 1);
 }

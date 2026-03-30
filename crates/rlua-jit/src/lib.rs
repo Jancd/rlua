@@ -133,6 +133,7 @@ pub struct JitStats {
     pub cache_hits: u64,
     pub replay_entries: u64,
     pub side_exits: u64,
+    pub invalidated_bypasses: u64,
     pub optimize_attempts: u64,
     pub optimized_traces: u64,
     pub native_compile_attempts: u64,
@@ -157,7 +158,9 @@ pub struct TraceCacheDebugEntry {
     pub lifecycle_state: TraceLifecycleState,
     pub invalidation_reason: Option<TraceInvalidationReason>,
     pub last_execution: TraceExecutionState,
+    pub replay_entries: u64,
     pub side_exit_count: u64,
+    pub invalidated_bypasses: u64,
     pub native_state: NativeArtifactState,
     pub native_entries: u64,
 }
@@ -173,7 +176,9 @@ pub struct CachedTraceHandle {
     pub lifecycle_state: TraceLifecycleState,
     pub invalidation_reason: Option<TraceInvalidationReason>,
     pub last_execution: TraceExecutionState,
+    pub replay_entries: u64,
     pub side_exit_count: u64,
+    pub invalidated_bypasses: u64,
     pub native_state: NativeArtifactState,
 }
 
@@ -315,7 +320,9 @@ struct CachedTrace {
     lifecycle_state: TraceLifecycleState,
     invalidation_reason: Option<TraceInvalidationReason>,
     last_execution: TraceExecutionState,
+    replay_entries: u64,
     side_exit_count: u64,
+    invalidated_bypasses: u64,
     native_state: NativeArtifactState,
     native_entries: u64,
 }
@@ -332,7 +339,9 @@ impl CachedTrace {
             lifecycle_state: self.lifecycle_state,
             invalidation_reason: self.invalidation_reason,
             last_execution: self.last_execution,
+            replay_entries: self.replay_entries,
             side_exit_count: self.side_exit_count,
+            invalidated_bypasses: self.invalidated_bypasses,
             native_state: self.native_state,
         }
     }
@@ -349,7 +358,9 @@ impl CachedTrace {
             lifecycle_state: self.lifecycle_state,
             invalidation_reason: self.invalidation_reason,
             last_execution: self.last_execution,
+            replay_entries: self.replay_entries,
             side_exit_count: self.side_exit_count,
+            invalidated_bypasses: self.invalidated_bypasses,
             native_state: self.native_state,
             native_entries: self.native_entries,
         }
@@ -515,7 +526,9 @@ impl JitRuntime {
                 lifecycle_state,
                 invalidation_reason: None,
                 last_execution: TraceExecutionState::None,
+                replay_entries: 0,
                 side_exit_count: 0,
+                invalidated_bypasses: 0,
                 native_state,
                 native_entries: 0,
             },
@@ -552,6 +565,7 @@ impl JitRuntime {
     pub fn note_replay_entry(&mut self, key: TraceKey) {
         self.stats.replay_entries += 1;
         if let Some(cached) = self.trace_cache.get_mut(&key) {
+            cached.replay_entries += 1;
             cached.last_execution = TraceExecutionState::Replay;
         }
 
@@ -615,6 +629,23 @@ impl JitRuntime {
         let _ = (key, downgraded);
     }
 
+    pub fn note_invalidated_bypass(&mut self, key: TraceKey) {
+        self.stats.invalidated_bypasses += 1;
+        if let Some(cached) = self.trace_cache.get_mut(&key) {
+            cached.invalidated_bypasses += 1;
+            cached.last_execution = TraceExecutionState::InterpreterFallback;
+        }
+
+        #[cfg(feature = "trace-jit")]
+        eprintln!(
+            "[trace-jit] invalidated-bypass function=0x{:x} loop_header_pc={}",
+            key.function, key.loop_header_pc
+        );
+
+        #[cfg(not(feature = "trace-jit"))]
+        let _ = key;
+    }
+
     pub fn note_side_exit(
         &mut self,
         key: TraceKey,
@@ -630,6 +661,7 @@ impl JitRuntime {
         if let Some(cached) = self.trace_cache.get_mut(&key) {
             cached.side_exit_count = cached.side_exit_count.saturating_add(1);
             cached.last_deopt = deopt.cloned();
+            cached.last_execution = TraceExecutionState::InterpreterFallback;
 
             if cached.lifecycle_state == TraceLifecycleState::Active
                 && cached.side_exit_count >= downgrade_threshold
