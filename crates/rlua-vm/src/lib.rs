@@ -608,6 +608,7 @@ fn maybe_run_cached_trace(
     };
 
     if cached.lifecycle_state == TraceLifecycleState::Invalidated {
+        state.jit.note_invalidated_bypass(key);
         #[cfg(feature = "trace-jit")]
         eprintln!(
             "[trace-jit] bypass-invalidated function=0x{:x} loop_header_pc={} generation={}",
@@ -1834,6 +1835,7 @@ mod tests {
     use rlua_core::bytecode::Instruction;
     use rlua_core::function::FunctionProto;
     use rlua_core::opcode::Opcode;
+    use rlua_jit::TraceExecutionState;
 
     fn make_proto(code: Vec<Instruction>, constants: Vec<LuaValue>) -> FunctionProto {
         FunctionProto {
@@ -2065,9 +2067,14 @@ mod tests {
         assert_eq!(debug.stats.replay_entries, 1);
         assert_eq!(debug.stats.side_exits, 1);
         assert_eq!(debug.trace_count, 1);
+        assert_eq!(debug.traces[0].replay_entries, 1);
         assert_eq!(
             debug.traces[0].lifecycle_state,
             TraceLifecycleState::ReplayOnly
+        );
+        assert_eq!(
+            debug.traces[0].last_execution,
+            TraceExecutionState::InterpreterFallback
         );
         assert_eq!(debug.traces[0].side_exit_count, 1);
         assert!(matches!(
@@ -2135,6 +2142,12 @@ mod tests {
         assert_eq!(debug.traces[0].side_exit_count, 2);
         assert_eq!(debug.stats.replay_entries, replay_entries_after_second);
         assert_eq!(debug.stats.side_exits, 2);
+        assert_eq!(debug.stats.invalidated_bypasses, 1);
+        assert_eq!(debug.traces[0].invalidated_bypasses, 1);
+        assert_eq!(
+            debug.traces[0].last_execution,
+            TraceExecutionState::InterpreterFallback
+        );
     }
 
     #[test]

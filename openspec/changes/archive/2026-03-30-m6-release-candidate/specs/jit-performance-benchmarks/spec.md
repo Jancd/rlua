@@ -2,6 +2,8 @@
 
 M6 carries the benchmark harness forward from performance tuning into release-candidate validation, so its workload set and output can be used directly for RC triage and acceptance decisions.
 
+## MODIFIED Requirements
+
 ### Requirement: JIT Benchmark Harness
 The project MUST provide a benchmark harness that can execute the supported JIT workload set in both interpreter-only and JIT-enabled modes under comparable host configuration and support targeted workload reruns for triage.
 
