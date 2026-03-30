@@ -10,12 +10,13 @@ use rlua_core::bytecode::Instruction;
 use rlua_core::opcode::Opcode;
 use rlua_core::value::LuaValue;
 use rlua_ir::{
-    ArithmeticOp, ConstantValue, OptimizationReport, OptimizedTrace, Trace, TraceOperand,
-    TraceStep, TraceStepKind, ValueType, optimize_trace,
+    ArithmeticOp, ConstantValue, OptimizationReport, OptimizedTrace, Trace, TraceDeoptExit,
+    TraceOperand, TraceStep, TraceStepKind, ValueType, optimize_trace,
 };
 use x86_64::{EncodedTrace, X86_64TraceCompiler};
 
 pub const DEFAULT_HOT_THRESHOLD: u32 = 32;
+pub const DEFAULT_SIDE_EXIT_THRESHOLD: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitAvailability {
@@ -56,6 +57,7 @@ pub const fn detect_jit_availability() -> JitAvailability {
 pub struct JitConfig {
     pub enabled: bool,
     pub hot_threshold: u32,
+    pub side_exit_threshold: u32,
 }
 
 impl Default for JitConfig {
@@ -63,6 +65,7 @@ impl Default for JitConfig {
         Self {
             enabled: true,
             hot_threshold: DEFAULT_HOT_THRESHOLD,
+            side_exit_threshold: DEFAULT_SIDE_EXIT_THRESHOLD,
         }
     }
 }
@@ -101,6 +104,27 @@ pub enum NativeArtifactState {
     CompileFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceLifecycleState {
+    Active,
+    ReplayOnly,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceInvalidationReason {
+    NativeFailure,
+    SideExitThreshold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceExecutionState {
+    None,
+    Native,
+    Replay,
+    InterpreterFallback,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JitStats {
     pub hot_loop_triggers: u64,
@@ -116,14 +140,24 @@ pub struct JitStats {
     pub native_compile_skips: u64,
     pub native_entries: u64,
     pub native_failures: u64,
+    pub trace_downgrades: u64,
+    pub trace_invalidations: u64,
+    pub trace_recompiles: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceCacheDebugEntry {
     pub function: usize,
     pub loop_header_pc: usize,
+    pub generation: u64,
     pub optimized: bool,
     pub optimization_report: OptimizationReport,
+    pub deopt_exits: Vec<TraceDeoptExit>,
+    pub last_deopt: Option<TraceDeoptExit>,
+    pub lifecycle_state: TraceLifecycleState,
+    pub invalidation_reason: Option<TraceInvalidationReason>,
+    pub last_execution: TraceExecutionState,
+    pub side_exit_count: u64,
     pub native_state: NativeArtifactState,
     pub native_entries: u64,
 }
@@ -132,7 +166,14 @@ pub struct TraceCacheDebugEntry {
 pub struct CachedTraceHandle {
     pub trace: Trace,
     pub optimized: OptimizedTrace,
+    pub deopt_exits: Vec<TraceDeoptExit>,
     pub native: Option<Rc<NativeTraceArtifact>>,
+    pub generation: u64,
+    pub last_deopt: Option<TraceDeoptExit>,
+    pub lifecycle_state: TraceLifecycleState,
+    pub invalidation_reason: Option<TraceInvalidationReason>,
+    pub last_execution: TraceExecutionState,
+    pub side_exit_count: u64,
     pub native_state: NativeArtifactState,
 }
 
@@ -269,6 +310,12 @@ struct CachedTrace {
     trace: Trace,
     optimized: OptimizedTrace,
     native: Option<Rc<NativeTraceArtifact>>,
+    generation: u64,
+    last_deopt: Option<TraceDeoptExit>,
+    lifecycle_state: TraceLifecycleState,
+    invalidation_reason: Option<TraceInvalidationReason>,
+    last_execution: TraceExecutionState,
+    side_exit_count: u64,
     native_state: NativeArtifactState,
     native_entries: u64,
 }
@@ -278,7 +325,14 @@ impl CachedTrace {
         CachedTraceHandle {
             trace: self.trace.clone(),
             optimized: self.optimized.clone(),
+            deopt_exits: self.optimized.deopt_exits.clone(),
             native: self.native.clone(),
+            generation: self.generation,
+            last_deopt: self.last_deopt.clone(),
+            lifecycle_state: self.lifecycle_state,
+            invalidation_reason: self.invalidation_reason,
+            last_execution: self.last_execution,
+            side_exit_count: self.side_exit_count,
             native_state: self.native_state,
         }
     }
@@ -287,8 +341,15 @@ impl CachedTrace {
         TraceCacheDebugEntry {
             function: key.function,
             loop_header_pc: key.loop_header_pc,
+            generation: self.generation,
             optimized: !self.optimized.steps.is_empty(),
             optimization_report: self.optimized.report,
+            deopt_exits: self.optimized.deopt_exits.clone(),
+            last_deopt: self.last_deopt.clone(),
+            lifecycle_state: self.lifecycle_state,
+            invalidation_reason: self.invalidation_reason,
+            last_execution: self.last_execution,
+            side_exit_count: self.side_exit_count,
             native_state: self.native_state,
             native_entries: self.native_entries,
         }
@@ -316,6 +377,7 @@ impl JitRuntime {
         Self {
             config: JitConfig {
                 hot_threshold: config.hot_threshold.max(1),
+                side_exit_threshold: config.side_exit_threshold.max(1),
                 ..config
             },
             availability,
@@ -336,6 +398,10 @@ impl JitRuntime {
         self.config.hot_threshold
     }
 
+    pub const fn side_exit_threshold(&self) -> u32 {
+        self.config.side_exit_threshold
+    }
+
     pub const fn execution_mode(&self) -> ExecutionMode {
         match (self.config.enabled, self.availability) {
             (false, _) => ExecutionMode::InterpreterOnly,
@@ -346,6 +412,12 @@ impl JitRuntime {
 
     pub const fn is_active(&self) -> bool {
         self.config.enabled
+    }
+
+    pub fn should_record_trace(&self, key: &TraceKey) -> bool {
+        self.trace_cache
+            .get(key)
+            .is_none_or(|cached| cached.lifecycle_state == TraceLifecycleState::Invalidated)
     }
 
     pub fn note_hot_loop_trigger(&mut self, key: TraceKey) {
@@ -390,40 +462,47 @@ impl JitRuntime {
     ) -> Result<bool, JitError> {
         self.stats.record_attempts += 1;
 
-        if self.trace_cache.contains_key(&request.key) {
-            return Ok(false);
-        }
+        let generation = if let Some(existing) = self.trace_cache.get(&request.key) {
+            if existing.lifecycle_state != TraceLifecycleState::Invalidated {
+                return Ok(false);
+            }
+            self.stats.trace_recompiles += 1;
+            existing.generation.saturating_add(1)
+        } else {
+            0
+        };
 
         let trace = recorder.record(request)?;
-        self.stats.optimize_attempts += 1;
-        let optimized = optimize_trace(&trace);
-        self.stats.optimized_traces += 1;
-
-        let (native, native_state) = self.prepare_native_artifact(&optimized);
-
-        self.trace_cache.insert(
-            request.key,
-            CachedTrace {
-                trace,
-                optimized,
-                native,
-                native_state,
-                native_entries: 0,
-            },
-        );
-        self.stats.trace_installs += 1;
+        self.install_cached_trace(request.key, generation, trace);
         Ok(true)
     }
 
     pub fn install_trace(&mut self, key: TraceKey, trace: Trace) -> bool {
-        if self.trace_cache.contains_key(&key) {
-            return false;
-        }
+        let generation = if let Some(existing) = self.trace_cache.get(&key) {
+            if existing.lifecycle_state != TraceLifecycleState::Invalidated {
+                return false;
+            }
+            self.stats.trace_recompiles += 1;
+            existing.generation.saturating_add(1)
+        } else {
+            0
+        };
 
+        self.install_cached_trace(key, generation, trace);
+        true
+    }
+
+    fn install_cached_trace(&mut self, key: TraceKey, generation: u64, trace: Trace) {
         self.stats.optimize_attempts += 1;
         let optimized = optimize_trace(&trace);
         self.stats.optimized_traces += 1;
+
         let (native, native_state) = self.prepare_native_artifact(&optimized);
+        let lifecycle_state = if native.is_some() {
+            TraceLifecycleState::Active
+        } else {
+            TraceLifecycleState::ReplayOnly
+        };
 
         self.trace_cache.insert(
             key,
@@ -431,12 +510,25 @@ impl JitRuntime {
                 trace,
                 optimized,
                 native,
+                generation,
+                last_deopt: None,
+                lifecycle_state,
+                invalidation_reason: None,
+                last_execution: TraceExecutionState::None,
+                side_exit_count: 0,
                 native_state,
                 native_entries: 0,
             },
         );
         self.stats.trace_installs += 1;
-        true
+
+        #[cfg(feature = "trace-jit")]
+        if generation > 0 {
+            eprintln!(
+                "[trace-jit] recompile function=0x{:x} loop_header_pc={} generation={} lifecycle={:?} native_state={:?}",
+                key.function, key.loop_header_pc, generation, lifecycle_state, native_state
+            );
+        }
     }
 
     pub fn trace_count(&self) -> usize {
@@ -459,6 +551,9 @@ impl JitRuntime {
 
     pub fn note_replay_entry(&mut self, key: TraceKey) {
         self.stats.replay_entries += 1;
+        if let Some(cached) = self.trace_cache.get_mut(&key) {
+            cached.last_execution = TraceExecutionState::Replay;
+        }
 
         #[cfg(feature = "trace-jit")]
         eprintln!(
@@ -474,6 +569,7 @@ impl JitRuntime {
         self.stats.native_entries += 1;
         if let Some(cached) = self.trace_cache.get_mut(&key) {
             cached.native_entries += 1;
+            cached.last_execution = TraceExecutionState::Native;
         }
 
         #[cfg(feature = "trace-jit")]
@@ -488,28 +584,106 @@ impl JitRuntime {
 
     pub fn note_native_failure(&mut self, key: TraceKey) {
         self.stats.native_failures += 1;
+        let mut downgraded = false;
+        if let Some(cached) = self.trace_cache.get_mut(&key) {
+            if cached.lifecycle_state == TraceLifecycleState::Active {
+                self.stats.trace_downgrades += 1;
+                downgraded = true;
+            }
+            cached.lifecycle_state = TraceLifecycleState::ReplayOnly;
+            cached.invalidation_reason = Some(TraceInvalidationReason::NativeFailure);
+            cached.last_execution = TraceExecutionState::InterpreterFallback;
+        }
 
         #[cfg(feature = "trace-jit")]
-        eprintln!(
-            "[trace-jit] native-failure function=0x{:x} loop_header_pc={}",
-            key.function, key.loop_header_pc
-        );
+        {
+            eprintln!(
+                "[trace-jit] native-failure function=0x{:x} loop_header_pc={}",
+                key.function, key.loop_header_pc
+            );
+            if downgraded {
+                eprintln!(
+                    "[trace-jit] downgrade function=0x{:x} loop_header_pc={} reason={:?}",
+                    key.function,
+                    key.loop_header_pc,
+                    TraceInvalidationReason::NativeFailure
+                );
+            }
+        }
 
         #[cfg(not(feature = "trace-jit"))]
-        let _ = key;
+        let _ = (key, downgraded);
     }
 
-    pub fn note_side_exit(&mut self, key: TraceKey, resume_pc: usize) {
+    pub fn note_side_exit(
+        &mut self,
+        key: TraceKey,
+        resume_pc: usize,
+        deopt: Option<&TraceDeoptExit>,
+    ) {
         self.stats.side_exits += 1;
+        let downgrade_threshold = self.side_exit_threshold() as u64;
+        let invalidate_threshold = downgrade_threshold.saturating_mul(2);
+        let mut downgraded = false;
+        let mut invalidated = false;
+
+        if let Some(cached) = self.trace_cache.get_mut(&key) {
+            cached.side_exit_count = cached.side_exit_count.saturating_add(1);
+            cached.last_deopt = deopt.cloned();
+
+            if cached.lifecycle_state == TraceLifecycleState::Active
+                && cached.side_exit_count >= downgrade_threshold
+            {
+                cached.lifecycle_state = TraceLifecycleState::ReplayOnly;
+                cached.invalidation_reason = Some(TraceInvalidationReason::SideExitThreshold);
+                self.stats.trace_downgrades += 1;
+                downgraded = true;
+            }
+
+            if cached.lifecycle_state != TraceLifecycleState::Invalidated
+                && cached.side_exit_count >= invalidate_threshold
+            {
+                cached.lifecycle_state = TraceLifecycleState::Invalidated;
+                cached.invalidation_reason = Some(TraceInvalidationReason::SideExitThreshold);
+                self.stats.trace_invalidations += 1;
+                invalidated = true;
+            }
+        }
 
         #[cfg(feature = "trace-jit")]
-        eprintln!(
-            "[trace-jit] side-exit function=0x{:x} loop_header_pc={} resume_pc={}",
-            key.function, key.loop_header_pc, resume_pc
-        );
+        {
+            match deopt {
+                Some(deopt) => eprintln!(
+                    "[trace-jit] side-exit function=0x{:x} loop_header_pc={} resume_pc={} deopt={:?}",
+                    key.function, key.loop_header_pc, resume_pc, deopt.kind
+                ),
+                None => eprintln!(
+                    "[trace-jit] side-exit function=0x{:x} loop_header_pc={} resume_pc={}",
+                    key.function, key.loop_header_pc, resume_pc
+                ),
+            }
+
+            if downgraded {
+                eprintln!(
+                    "[trace-jit] downgrade function=0x{:x} loop_header_pc={} reason={:?}",
+                    key.function,
+                    key.loop_header_pc,
+                    TraceInvalidationReason::SideExitThreshold
+                );
+            }
+
+            if invalidated {
+                eprintln!(
+                    "[trace-jit] invalidated function=0x{:x} loop_header_pc={} reason={:?}",
+                    key.function,
+                    key.loop_header_pc,
+                    TraceInvalidationReason::SideExitThreshold
+                );
+            }
+        }
 
         #[cfg(not(feature = "trace-jit"))]
-        let _ = (key, resume_pc);
+        let _ = (key, resume_pc, deopt, downgraded, invalidated);
     }
 
     fn prepare_native_artifact(
@@ -764,9 +938,14 @@ mod tests {
         assert_eq!(runtime.stats().record_attempts, 2);
         assert_eq!(runtime.stats().optimize_attempts, 1);
 
+        let cached = runtime.lookup_cached_trace(&request.key).unwrap();
+        assert_eq!(cached.deopt_exits, cached.optimized.deopt_exits);
+        assert!(!cached.deopt_exits.is_empty());
+
         let debug = runtime.trace_debug_entries();
         assert_eq!(debug.len(), 1);
         assert!(debug[0].optimized);
+        assert_eq!(debug[0].deopt_exits, cached.deopt_exits);
     }
 
     #[test]
@@ -793,6 +972,115 @@ mod tests {
             NativeArtifactState::UnsupportedArch
         };
         assert_eq!(debug[0].native_state, expected);
+    }
+
+    #[test]
+    fn side_exit_policy_downgrades_then_invalidates_trace() {
+        let request = RecordingRequest {
+            key: TraceKey::new(0xabc, 0),
+            code: &[
+                Instruction::encode_abc(Opcode::Add, 0, 1, 2),
+                Instruction::encode_asbx(Opcode::ForLoop, 1, -2),
+            ],
+            constants: &[],
+            slot_types: &[
+                ValueType::Number,
+                ValueType::Number,
+                ValueType::Number,
+                ValueType::Number,
+            ],
+        };
+
+        let mut runtime = JitRuntime::new(JitConfig {
+            side_exit_threshold: 1,
+            ..JitConfig::default()
+        });
+        let mut recorder = LoopTraceRecorder;
+        runtime.record_trace(&mut recorder, &request).unwrap();
+
+        let cached = runtime.lookup_cached_trace(&request.key).unwrap();
+        let deopt = cached
+            .deopt_exits
+            .iter()
+            .find(|exit| matches!(exit.kind, rlua_ir::TraceDeoptExitKind::SideExit { .. }))
+            .cloned()
+            .unwrap();
+
+        runtime.note_side_exit(request.key, deopt.resume_pc, Some(&deopt));
+
+        let debug = runtime.trace_debug_entries();
+        assert_eq!(debug.len(), 1);
+        assert_eq!(debug[0].lifecycle_state, TraceLifecycleState::ReplayOnly);
+        assert_eq!(
+            debug[0].invalidation_reason,
+            Some(TraceInvalidationReason::SideExitThreshold)
+        );
+        assert_eq!(debug[0].last_deopt, Some(deopt.clone()));
+        assert_eq!(debug[0].side_exit_count, 1);
+        assert_eq!(runtime.stats().trace_downgrades, 1);
+        assert_eq!(runtime.stats().trace_invalidations, 0);
+
+        runtime.note_side_exit(request.key, deopt.resume_pc, Some(&deopt));
+
+        let debug = runtime.trace_debug_entries();
+        assert_eq!(debug[0].lifecycle_state, TraceLifecycleState::Invalidated);
+        assert_eq!(debug[0].last_deopt, Some(deopt));
+        assert_eq!(debug[0].side_exit_count, 2);
+        assert_eq!(runtime.stats().trace_downgrades, 1);
+        assert_eq!(runtime.stats().trace_invalidations, 1);
+    }
+
+    #[test]
+    fn invalidated_trace_can_be_replaced_with_fresh_generation() {
+        let request = RecordingRequest {
+            key: TraceKey::new(0xabc, 0),
+            code: &[
+                Instruction::encode_abc(Opcode::Add, 0, 1, 2),
+                Instruction::encode_asbx(Opcode::ForLoop, 1, -2),
+            ],
+            constants: &[],
+            slot_types: &[
+                ValueType::Number,
+                ValueType::Number,
+                ValueType::Number,
+                ValueType::Number,
+            ],
+        };
+
+        let mut runtime = JitRuntime::new(JitConfig {
+            side_exit_threshold: 1,
+            ..JitConfig::default()
+        });
+        let mut recorder = LoopTraceRecorder;
+        runtime.record_trace(&mut recorder, &request).unwrap();
+
+        let cached = runtime.lookup_cached_trace(&request.key).unwrap();
+        let deopt = cached
+            .deopt_exits
+            .iter()
+            .find(|exit| matches!(exit.kind, rlua_ir::TraceDeoptExitKind::SideExit { .. }))
+            .cloned()
+            .unwrap();
+
+        runtime.note_side_exit(request.key, deopt.resume_pc, Some(&deopt));
+        runtime.note_side_exit(request.key, deopt.resume_pc, Some(&deopt));
+
+        assert!(runtime.should_record_trace(&request.key));
+        assert!(runtime.record_trace(&mut recorder, &request).unwrap());
+
+        let replacement = runtime.lookup_cached_trace(&request.key).unwrap();
+        let expected_state = if replacement.native.is_some() {
+            TraceLifecycleState::Active
+        } else {
+            TraceLifecycleState::ReplayOnly
+        };
+
+        assert_eq!(replacement.generation, 1);
+        assert_eq!(replacement.lifecycle_state, expected_state);
+        assert_eq!(replacement.invalidation_reason, None);
+        assert!(replacement.last_deopt.is_none());
+        assert_eq!(replacement.side_exit_count, 0);
+        assert_eq!(runtime.stats().trace_recompiles, 1);
     }
 
     #[test]
@@ -823,6 +1111,7 @@ mod tests {
                     },
                 ),
             ],
+            deopt_exits: Vec::new(),
             report: OptimizationReport::default(),
             native_supported: true,
         };
@@ -833,9 +1122,9 @@ mod tests {
 
         let outcome = artifact.execute(&mut slots);
 
-        assert_eq!(outcome, NativeTraceOutcome::ContinueLoop);
-        assert_eq!(slots[0], 11.0);
-        assert_eq!(slots[1], 2.0);
-        assert_eq!(slots[4], 2.0);
+        assert_eq!(outcome, NativeTraceOutcome::SideExit(6));
+        assert_eq!(slots[0], 20.0);
+        assert_eq!(slots[1], 4.0);
+        assert_eq!(slots[4], 4.0);
     }
 }

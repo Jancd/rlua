@@ -21,6 +21,20 @@ pub struct SideExit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceDeoptExitKind {
+    Guard { guard_id: u32, slot: u16 },
+    SideExit { pc: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceDeoptExit {
+    pub kind: TraceDeoptExitKind,
+    pub resume_pc: usize,
+    pub live_in_slots: Vec<u16>,
+    pub materialized_slots: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceGuard {
     pub id: u32,
     pub slot: u16,
@@ -230,6 +244,7 @@ pub struct OptimizedTrace {
     pub exit_pc: usize,
     pub guards: Vec<TraceGuard>,
     pub steps: Vec<TraceStep>,
+    pub deopt_exits: Vec<TraceDeoptExit>,
     pub report: OptimizationReport,
     pub native_supported: bool,
 }
@@ -242,6 +257,7 @@ impl OptimizedTrace {
             exit_pc: trace.exit_pc,
             guards: trace.guards.clone(),
             steps: trace.steps.clone(),
+            deopt_exits: Vec::new(),
             report: OptimizationReport::default(),
             native_supported: false,
         }
@@ -278,25 +294,28 @@ impl OptimizedTrace {
     }
 
     pub fn read_slots(&self) -> Vec<u16> {
-        let mut slots = HashSet::new();
-        let mut defined = HashSet::new();
+        trace_live_in_slots(&self.guards, &self.steps)
+    }
 
-        for guard in &self.guards {
-            slots.insert(guard.slot);
-        }
+    pub fn guard_deopt_exit(&self, guard_id: u32) -> Option<&TraceDeoptExit> {
+        self.deopt_exits.iter().find(|exit| {
+            matches!(
+                exit.kind,
+                TraceDeoptExitKind::Guard {
+                    guard_id: candidate,
+                    ..
+                } if candidate == guard_id
+            )
+        })
+    }
 
-        for step in &self.steps {
-            for slot in slots_read_by_step(step) {
-                if !defined.contains(&slot) {
-                    slots.insert(slot);
-                }
-            }
-            defined.extend(slots_written_by_step(step));
-        }
-
-        let mut slots: Vec<u16> = slots.into_iter().collect();
-        slots.sort_unstable();
-        slots
+    pub fn side_exit_deopt(&self, pc: usize) -> Option<&TraceDeoptExit> {
+        self.deopt_exits.iter().find(|exit| {
+            matches!(
+                exit.kind,
+                TraceDeoptExitKind::SideExit { pc: candidate } if candidate == pc
+            )
+        })
     }
 }
 
@@ -310,6 +329,7 @@ pub struct NoopOptimizer;
 impl TraceOptimizer for NoopOptimizer {
     fn optimize(&self, trace: &Trace) -> OptimizedTrace {
         let mut optimized = OptimizedTrace::from_trace(trace);
+        optimized.deopt_exits = derive_deopt_exits(&optimized.guards, &optimized.steps);
         optimized.native_supported = is_native_trace_supported(&trace.steps);
         optimized
     }
@@ -333,6 +353,7 @@ impl TraceOptimizer for M4TraceOptimizer {
 
         optimized.guards = guards;
         optimized.steps = steps;
+        optimized.deopt_exits = derive_deopt_exits(&optimized.guards, &optimized.steps);
         optimized.native_supported = is_native_trace_supported(&optimized.steps);
         optimized.report = report;
         optimized
@@ -454,6 +475,65 @@ fn resolve_operand(operand: TraceOperand, constants: &HashMap<u16, ConstantValue
             .map_or(TraceOperand::Slot(slot), TraceOperand::Constant),
         TraceOperand::Constant(_) => operand,
     }
+}
+
+fn derive_deopt_exits(guards: &[TraceGuard], steps: &[TraceStep]) -> Vec<TraceDeoptExit> {
+    let live_in_slots = trace_live_in_slots(guards, steps);
+    let mut exits = Vec::new();
+
+    for guard in guards {
+        exits.push(TraceDeoptExit {
+            kind: TraceDeoptExitKind::Guard {
+                guard_id: guard.id,
+                slot: guard.slot,
+            },
+            resume_pc: guard.exit.resume_pc,
+            live_in_slots: live_in_slots.clone(),
+            materialized_slots: Vec::new(),
+        });
+    }
+
+    let mut materialized = HashSet::new();
+    for step in steps {
+        if let TraceStepKind::ForLoop { exit_resume_pc, .. } = step.kind {
+            exits.push(TraceDeoptExit {
+                kind: TraceDeoptExitKind::SideExit { pc: step.source.pc },
+                resume_pc: exit_resume_pc,
+                live_in_slots: live_in_slots.clone(),
+                materialized_slots: sorted_slots(materialized.iter().copied().collect()),
+            });
+        }
+
+        materialized.extend(slots_written_by_step(step));
+    }
+
+    exits
+}
+
+fn trace_live_in_slots(guards: &[TraceGuard], steps: &[TraceStep]) -> Vec<u16> {
+    let mut slots = HashSet::new();
+    let mut defined = HashSet::new();
+
+    for guard in guards {
+        slots.insert(guard.slot);
+    }
+
+    for step in steps {
+        for slot in slots_read_by_step(step) {
+            if !defined.contains(&slot) {
+                slots.insert(slot);
+            }
+        }
+        defined.extend(slots_written_by_step(step));
+    }
+
+    sorted_slots(slots)
+}
+
+fn sorted_slots(slots: HashSet<u16>) -> Vec<u16> {
+    let mut slots: Vec<u16> = slots.into_iter().collect();
+    slots.sort_unstable();
+    slots
 }
 
 fn initial_live_slots(guards: &[TraceGuard], steps: &[TraceStep]) -> HashSet<u16> {
@@ -771,6 +851,61 @@ mod tests {
         assert_eq!(optimized.guards.len(), 1);
         assert_eq!(optimized.guards[0].id, 0);
         assert_eq!(optimized.report.simplified_guards, 1);
+    }
+
+    #[test]
+    fn optimizer_derives_explicit_deopt_exits_for_guards_and_loop_exit() {
+        let mut trace = Trace::new(1, 5);
+        let guard_id = trace.push_guard(0, ValueType::Number, 5);
+        trace.push_step(TraceStep::new(
+            5,
+            Instruction::encode_abc(Opcode::Add, 5, 0, 4),
+            TraceStepKind::Arithmetic {
+                dst: 5,
+                op: ArithmeticOp::Add,
+                lhs: TraceOperand::slot(0),
+                rhs: TraceOperand::slot(4),
+            },
+        ));
+        trace.push_step(TraceStep::new(
+            6,
+            Instruction::encode_abc(Opcode::Move, 0, 5, 0),
+            TraceStepKind::Copy {
+                dst: 0,
+                value: TraceOperand::slot(5),
+            },
+        ));
+        trace.push_step(TraceStep::new(
+            7,
+            Instruction::encode_asbx(Opcode::ForLoop, 1, -3),
+            TraceStepKind::ForLoop {
+                base: 1,
+                exit_resume_pc: 8,
+            },
+        ));
+
+        let optimized = optimize_trace(&trace);
+        let guard_exit = optimized.guard_deopt_exit(guard_id).unwrap();
+        let side_exit = optimized.side_exit_deopt(7).unwrap();
+
+        assert_eq!(optimized.deopt_exits.len(), 2);
+        assert_eq!(guard_exit.resume_pc, 5);
+        assert_eq!(guard_exit.live_in_slots, vec![0, 1, 2, 3, 4]);
+        assert!(guard_exit.materialized_slots.is_empty());
+        assert_eq!(side_exit.resume_pc, 8);
+        assert_eq!(side_exit.live_in_slots, vec![0, 1, 2, 3, 4]);
+        assert_eq!(side_exit.materialized_slots, vec![0, 5]);
+        assert!(matches!(
+            guard_exit.kind,
+            TraceDeoptExitKind::Guard {
+                guard_id: 0,
+                slot: 0
+            }
+        ));
+        assert!(matches!(
+            side_exit.kind,
+            TraceDeoptExitKind::SideExit { pc: 7 }
+        ));
     }
 
     #[test]

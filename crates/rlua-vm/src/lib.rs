@@ -8,10 +8,12 @@ use rlua_core::gc::{GcRoot, GcRootProvider, MarkSweepGc, RootSource};
 use rlua_core::opcode::Opcode;
 use rlua_core::table::{LuaTable, TableRef};
 use rlua_core::value::LuaValue;
-use rlua_ir::{IrOp, Trace, ValueType};
+#[cfg(test)]
+use rlua_ir::Trace;
+use rlua_ir::{IrOp, TraceDeoptExit, TraceDeoptExitKind, ValueType};
 use rlua_jit::{
     ExecutionMode, JitAvailability, JitConfig, JitRuntime, JitStats, LoopTraceRecorder,
-    NativeTraceOutcome, RecordingRequest, TraceCacheDebugEntry, TraceKey,
+    NativeTraceOutcome, RecordingRequest, TraceCacheDebugEntry, TraceKey, TraceLifecycleState,
 };
 
 // ---------------------------------------------------------------------------
@@ -294,7 +296,7 @@ impl VmState {
             *counter
         };
 
-        if self.jit.lookup_trace(&key).is_some() {
+        if !self.jit.should_record_trace(&key) {
             return;
         }
 
@@ -605,47 +607,68 @@ fn maybe_run_cached_trace(
         cached
     };
 
-    match try_run_native_trace(state, base, key, &cached)? {
-        NativeTraceResult::Completed => {
-            state.frames.last_mut().unwrap().pc = cached.trace.exit_pc;
-            return Ok(true);
+    if cached.lifecycle_state == TraceLifecycleState::Invalidated {
+        #[cfg(feature = "trace-jit")]
+        eprintln!(
+            "[trace-jit] bypass-invalidated function=0x{:x} loop_header_pc={} generation={}",
+            key.function, key.loop_header_pc, cached.generation
+        );
+        return Ok(false);
+    }
+
+    if cached.lifecycle_state == TraceLifecycleState::Active {
+        match try_run_native_trace(state, base, key, &cached)? {
+            NativeTraceResult::Completed => {
+                state.frames.last_mut().unwrap().pc = cached.trace.exit_pc;
+                return Ok(true);
+            }
+            NativeTraceResult::SideExit(exit) => {
+                state
+                    .jit
+                    .note_side_exit(key, exit.resume_pc, Some(&exit.deopt));
+                state.pending_side_exit = Some(key);
+                state.frames.last_mut().unwrap().pc = exit.resume_pc;
+                return Ok(true);
+            }
+            NativeTraceResult::FallbackToReplay => {}
         }
-        NativeTraceResult::SideExit(resume_pc) => {
-            state.jit.note_side_exit(key, resume_pc);
-            state.pending_side_exit = Some(key);
-            state.frames.last_mut().unwrap().pc = resume_pc;
-            return Ok(true);
-        }
-        NativeTraceResult::FallbackToReplay => {}
     }
 
     state.jit.note_replay_entry(key);
 
-    match replay_trace(state, base, proto, key, &cached.trace)? {
+    match replay_trace(state, base, proto, key, &cached)? {
         TraceReplayResult::Completed => {
             state.frames.last_mut().unwrap().pc = cached.trace.exit_pc;
         }
-        TraceReplayResult::SideExit(resume_pc) => {
-            state.jit.note_side_exit(key, resume_pc);
+        TraceReplayResult::SideExit(exit) => {
+            state
+                .jit
+                .note_side_exit(key, exit.resume_pc, Some(&exit.deopt));
             state.pending_side_exit = Some(key);
-            state.frames.last_mut().unwrap().pc = resume_pc;
+            state.frames.last_mut().unwrap().pc = exit.resume_pc;
         }
     }
 
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TraceReplayResult {
     Completed,
-    SideExit(usize),
+    SideExit(TraceExitState),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeTraceResult {
     Completed,
-    SideExit(usize),
+    SideExit(TraceExitState),
     FallbackToReplay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceExitState {
+    resume_pc: usize,
+    deopt: TraceDeoptExit,
 }
 
 fn try_run_native_trace(
@@ -661,12 +684,15 @@ fn try_run_native_trace(
     for guard in &cached.optimized.guards {
         let actual = value_type_of(&state.get_reg(base, guard.slot as u8));
         if actual != guard.expected {
-            return Ok(NativeTraceResult::SideExit(guard.exit.resume_pc));
+            return Ok(NativeTraceResult::SideExit(TraceExitState {
+                resume_pc: guard.exit.resume_pc,
+                deopt: guard_deopt_exit(cached, guard.id, guard.slot, guard.exit.resume_pc),
+            }));
         }
     }
 
     let mut slots = vec![0.0; native.slot_count()];
-    for slot in cached.optimized.read_slots() {
+    for slot in trace_live_in_slots(cached) {
         let Some(value) = state.get_reg(base, slot as u8).to_number() else {
             state.jit.note_native_failure(key);
             return Ok(NativeTraceResult::FallbackToReplay);
@@ -680,10 +706,19 @@ fn try_run_native_trace(
             state.jit.note_native_entry(key);
             Ok(NativeTraceResult::Completed)
         }
-        NativeTraceOutcome::SideExit(resume_pc) => {
-            sync_native_slots(state, base, native.written_slots(), &slots);
+        NativeTraceOutcome::SideExit(side_exit_pc) => {
+            let deopt = side_exit_deopt(
+                cached,
+                side_exit_pc,
+                side_exit_pc.saturating_add(1),
+                native.written_slots(),
+            );
+            sync_native_slots(state, base, &deopt.materialized_slots, &slots);
             state.jit.note_native_entry(key);
-            Ok(NativeTraceResult::SideExit(resume_pc))
+            Ok(NativeTraceResult::SideExit(TraceExitState {
+                resume_pc: deopt.resume_pc,
+                deopt,
+            }))
         }
         NativeTraceOutcome::Unavailable => {
             state.jit.note_native_failure(key);
@@ -700,19 +735,66 @@ fn sync_native_slots(state: &mut VmState, base: usize, written_slots: &[u16], sl
     }
 }
 
+fn trace_live_in_slots(cached: &rlua_jit::CachedTraceHandle) -> Vec<u16> {
+    cached
+        .deopt_exits
+        .first()
+        .map(|exit| exit.live_in_slots.clone())
+        .unwrap_or_else(|| cached.optimized.read_slots())
+}
+
+fn guard_deopt_exit(
+    cached: &rlua_jit::CachedTraceHandle,
+    guard_id: u32,
+    slot: u16,
+    resume_pc: usize,
+) -> TraceDeoptExit {
+    cached
+        .optimized
+        .guard_deopt_exit(guard_id)
+        .cloned()
+        .unwrap_or_else(|| TraceDeoptExit {
+            kind: TraceDeoptExitKind::Guard { guard_id, slot },
+            resume_pc,
+            live_in_slots: trace_live_in_slots(cached),
+            materialized_slots: Vec::new(),
+        })
+}
+
+fn side_exit_deopt(
+    cached: &rlua_jit::CachedTraceHandle,
+    side_exit_pc: usize,
+    resume_pc: usize,
+    materialized_slots: &[u16],
+) -> TraceDeoptExit {
+    cached
+        .optimized
+        .side_exit_deopt(side_exit_pc)
+        .cloned()
+        .unwrap_or_else(|| TraceDeoptExit {
+            kind: TraceDeoptExitKind::SideExit { pc: side_exit_pc },
+            resume_pc,
+            live_in_slots: trace_live_in_slots(cached),
+            materialized_slots: materialized_slots.to_vec(),
+        })
+}
+
 fn replay_trace(
     state: &mut VmState,
     base: usize,
     proto: &FunctionProto,
     key: TraceKey,
-    trace: &Trace,
+    cached: &rlua_jit::CachedTraceHandle,
 ) -> Result<TraceReplayResult, LuaError> {
-    for op in &trace.ops {
+    for op in &cached.trace.ops {
         match op {
             IrOp::GuardType(guard) => {
                 let actual = value_type_of(&state.get_reg(base, guard.slot as u8));
                 if actual != guard.expected {
-                    return Ok(TraceReplayResult::SideExit(guard.exit.resume_pc));
+                    return Ok(TraceReplayResult::SideExit(TraceExitState {
+                        resume_pc: guard.exit.resume_pc,
+                        deopt: guard_deopt_exit(cached, guard.id, guard.slot, guard.exit.resume_pc),
+                    }));
                 }
             }
             IrOp::Instruction(recorded) => {
@@ -724,7 +806,10 @@ fn replay_trace(
                     recorded.pc,
                     recorded.instruction,
                 )? {
-                    return Ok(TraceReplayResult::SideExit(resume_pc));
+                    return Ok(TraceReplayResult::SideExit(TraceExitState {
+                        resume_pc,
+                        deopt: side_exit_deopt(cached, recorded.pc, resume_pc, &[]),
+                    }));
                 }
             }
         }
@@ -1885,6 +1970,18 @@ mod tests {
         assert_eq!(debug.stats.trace_installs, 1);
         assert_eq!(debug.stats.optimize_attempts, 1);
         assert_eq!(debug.traces.len(), 1);
+        assert_eq!(debug.traces[0].side_exit_count, 1);
+        assert!(matches!(
+            debug.traces[0].last_deopt.as_ref().map(|exit| exit.kind),
+            Some(TraceDeoptExitKind::SideExit { .. })
+        ));
+        assert_eq!(
+            debug.traces[0]
+                .last_deopt
+                .as_ref()
+                .map(|exit| exit.resume_pc),
+            Some(7)
+        );
         if cfg!(target_arch = "x86_64") {
             assert!(debug.stats.native_compile_installs >= 1);
             assert!(debug.stats.native_entries >= 1);
@@ -1924,6 +2021,7 @@ mod tests {
         let mut state = VmState::with_jit_config(JitConfig {
             enabled: false,
             hot_threshold: 1,
+            ..JitConfig::default()
         });
         let results = execute(&mut state, proto).unwrap();
         let debug = state.jit_debug_state();
@@ -1967,6 +2065,76 @@ mod tests {
         assert_eq!(debug.stats.replay_entries, 1);
         assert_eq!(debug.stats.side_exits, 1);
         assert_eq!(debug.trace_count, 1);
+        assert_eq!(
+            debug.traces[0].lifecycle_state,
+            TraceLifecycleState::ReplayOnly
+        );
+        assert_eq!(debug.traces[0].side_exit_count, 1);
+        assert!(matches!(
+            debug.traces[0].last_deopt.as_ref().map(|exit| exit.kind),
+            Some(TraceDeoptExitKind::Guard {
+                guard_id: 0,
+                slot: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn invalidated_trace_is_bypassed_after_repeated_side_exits() {
+        let proto = Rc::new(FunctionProto {
+            code: vec![
+                Instruction::encode_abc(Opcode::Move, 0, 0, 0),
+                Instruction::encode_abc(Opcode::Return, 0, 2, 0),
+            ],
+            max_stack_size: 2,
+            num_params: 1,
+            is_vararg: false,
+            ..FunctionProto::new()
+        });
+        let closure = Rc::new(Closure::new(proto.clone()));
+        let key = TraceKey::new(Rc::as_ptr(&proto) as usize, 0);
+        let mut trace = Trace::new(key.function, 0);
+        trace.push_guard(0, ValueType::Number, 0);
+        trace.push_instruction(0, Instruction::encode_abc(Opcode::Move, 0, 0, 0));
+        trace.set_exit_pc(1);
+
+        let mut state = VmState::with_jit_config(JitConfig {
+            hot_threshold: 1,
+            side_exit_threshold: 1,
+            ..JitConfig::default()
+        });
+        assert!(state.jit.install_trace(key, trace));
+
+        let first = execute_closure(
+            &mut state,
+            closure.clone(),
+            &[LuaValue::from("not-a-number")],
+        )
+        .unwrap();
+        let second = execute_closure(
+            &mut state,
+            closure.clone(),
+            &[LuaValue::from("still-not-a-number")],
+        )
+        .unwrap();
+        let debug_after_second = state.jit_debug_state();
+        let replay_entries_after_second = debug_after_second.stats.replay_entries;
+
+        let third =
+            execute_closure(&mut state, closure, &[LuaValue::from("bypassed-now")]).unwrap();
+        let debug = state.jit_debug_state();
+
+        assert_eq!(first, vec![LuaValue::from("not-a-number")]);
+        assert_eq!(second, vec![LuaValue::from("still-not-a-number")]);
+        assert_eq!(third, vec![LuaValue::from("bypassed-now")]);
+        assert_eq!(debug.trace_count, 1);
+        assert_eq!(
+            debug.traces[0].lifecycle_state,
+            TraceLifecycleState::Invalidated
+        );
+        assert_eq!(debug.traces[0].side_exit_count, 2);
+        assert_eq!(debug.stats.replay_entries, replay_entries_after_second);
+        assert_eq!(debug.stats.side_exits, 2);
     }
 
     #[test]
