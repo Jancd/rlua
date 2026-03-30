@@ -547,7 +547,10 @@ impl JitRuntime {
         match NativeTraceArtifact::install(encoded) {
             Ok(artifact) => {
                 self.stats.native_compile_installs += 1;
-                (Some(Arc::new(artifact)), NativeArtifactState::Installed)
+                (
+                    Some(Arc::<NativeTraceArtifact>::new(artifact)),
+                    NativeArtifactState::Installed,
+                )
             }
             Err(err) => {
                 self.stats.native_failures += 1;
