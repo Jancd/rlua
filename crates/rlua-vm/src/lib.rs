@@ -10,7 +10,8 @@ use rlua_core::table::{LuaTable, TableRef};
 use rlua_core::value::LuaValue;
 use rlua_ir::{IrOp, Trace, ValueType};
 use rlua_jit::{
-    ExecutionMode, JitConfig, JitRuntime, JitStats, LoopTraceRecorder, RecordingRequest, TraceKey,
+    ExecutionMode, JitAvailability, JitConfig, JitRuntime, JitStats, LoopTraceRecorder,
+    NativeTraceOutcome, RecordingRequest, TraceCacheDebugEntry, TraceKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,10 +81,12 @@ pub struct HotLoopCounter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmJitDebugState {
     pub execution_mode: ExecutionMode,
+    pub availability: JitAvailability,
     pub config: JitConfig,
     pub counters: Vec<HotLoopCounter>,
     pub stats: JitStats,
     pub trace_count: usize,
+    pub traces: Vec<TraceCacheDebugEntry>,
 }
 
 impl VmState {
@@ -144,10 +147,12 @@ impl VmState {
 
         VmJitDebugState {
             execution_mode: self.jit.execution_mode(),
+            availability: self.jit.availability(),
             config: self.jit.config(),
             counters,
             stats: self.jit.stats(),
             trace_count: self.jit.trace_count(),
+            traces: self.jit.trace_debug_entries(),
         }
     }
 
@@ -306,6 +311,7 @@ impl VmState {
         let request = RecordingRequest {
             key,
             code: &proto.code,
+            constants: &proto.constants,
             slot_types: &slot_types,
         };
         let mut recorder = LoopTraceRecorder;
@@ -592,18 +598,32 @@ fn maybe_run_cached_trace(
         state.pending_side_exit = None;
     }
 
-    let trace = {
-        let Some(trace) = state.jit.lookup_trace(&key) else {
+    let cached = {
+        let Some(cached) = state.jit.lookup_cached_trace(&key) else {
             return Ok(false);
         };
-        trace.clone()
+        cached
     };
+
+    match try_run_native_trace(state, base, key, &cached)? {
+        NativeTraceResult::Completed => {
+            state.frames.last_mut().unwrap().pc = cached.trace.exit_pc;
+            return Ok(true);
+        }
+        NativeTraceResult::SideExit(resume_pc) => {
+            state.jit.note_side_exit(key, resume_pc);
+            state.pending_side_exit = Some(key);
+            state.frames.last_mut().unwrap().pc = resume_pc;
+            return Ok(true);
+        }
+        NativeTraceResult::FallbackToReplay => {}
+    }
 
     state.jit.note_replay_entry(key);
 
-    match replay_trace(state, base, proto, key, &trace)? {
+    match replay_trace(state, base, proto, key, &cached.trace)? {
         TraceReplayResult::Completed => {
-            state.frames.last_mut().unwrap().pc = trace.exit_pc;
+            state.frames.last_mut().unwrap().pc = cached.trace.exit_pc;
         }
         TraceReplayResult::SideExit(resume_pc) => {
             state.jit.note_side_exit(key, resume_pc);
@@ -619,6 +639,65 @@ fn maybe_run_cached_trace(
 enum TraceReplayResult {
     Completed,
     SideExit(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeTraceResult {
+    Completed,
+    SideExit(usize),
+    FallbackToReplay,
+}
+
+fn try_run_native_trace(
+    state: &mut VmState,
+    base: usize,
+    key: TraceKey,
+    cached: &rlua_jit::CachedTraceHandle,
+) -> Result<NativeTraceResult, LuaError> {
+    let Some(native) = cached.native.as_ref() else {
+        return Ok(NativeTraceResult::FallbackToReplay);
+    };
+
+    for guard in &cached.optimized.guards {
+        let actual = value_type_of(&state.get_reg(base, guard.slot as u8));
+        if actual != guard.expected {
+            return Ok(NativeTraceResult::SideExit(guard.exit.resume_pc));
+        }
+    }
+
+    let mut slots = vec![0.0; native.slot_count()];
+    for slot in cached.optimized.read_slots() {
+        let Some(value) = state.get_reg(base, slot as u8).to_number() else {
+            state.jit.note_native_failure(key);
+            return Ok(NativeTraceResult::FallbackToReplay);
+        };
+        slots[slot as usize] = value;
+    }
+
+    match native.execute(&mut slots) {
+        NativeTraceOutcome::ContinueLoop => {
+            sync_native_slots(state, base, native.written_slots(), &slots);
+            state.jit.note_native_entry(key);
+            Ok(NativeTraceResult::Completed)
+        }
+        NativeTraceOutcome::SideExit(resume_pc) => {
+            sync_native_slots(state, base, native.written_slots(), &slots);
+            state.jit.note_native_entry(key);
+            Ok(NativeTraceResult::SideExit(resume_pc))
+        }
+        NativeTraceOutcome::Unavailable => {
+            state.jit.note_native_failure(key);
+            Ok(NativeTraceResult::FallbackToReplay)
+        }
+    }
+}
+
+fn sync_native_slots(state: &mut VmState, base: usize, written_slots: &[u16], slots: &[f64]) {
+    for &slot in written_slots {
+        if let Some(value) = slots.get(slot as usize) {
+            state.set_reg(base, slot as u8, LuaValue::Number(*value));
+        }
+    }
 }
 
 fn replay_trace(
@@ -1804,7 +1883,16 @@ mod tests {
         assert_eq!(debug.trace_count, 1);
         assert_eq!(debug.stats.hot_loop_triggers, 1);
         assert_eq!(debug.stats.trace_installs, 1);
-        assert!(debug.stats.replay_entries >= 1);
+        assert_eq!(debug.stats.optimize_attempts, 1);
+        assert_eq!(debug.traces.len(), 1);
+        if cfg!(target_arch = "x86_64") {
+            assert!(debug.stats.native_compile_installs >= 1);
+            assert!(debug.stats.native_entries >= 1);
+        } else {
+            assert_eq!(debug.availability, JitAvailability::UnsupportedArch);
+            assert!(debug.stats.replay_entries >= 1);
+            assert_eq!(debug.stats.native_entries, 0);
+        }
         assert!(
             debug
                 .counters

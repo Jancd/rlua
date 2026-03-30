@@ -12,5 +12,6 @@ trace-jit = []
 ir-dump = ["rlua-ir/ir-dump"]
 
 [dependencies]
+libc = "0.2"
 rlua-core.workspace = true
 rlua-ir.workspace = true

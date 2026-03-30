@@ -78,7 +78,7 @@ The project MUST maintain test layering for unit, integration, differential, and
 - **THEN** directories or modules exist for conformance, differential, JIT, and fuzz-oriented tests
 
 ### Requirement: Diagnostics Feature Flags
-The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, JIT counters, and M3 replay/side-exit instrumentation.
+The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, optimizer activity, native code generation, JIT counters, and replay/side-exit instrumentation.
 
 #### Scenario: Diagnostics disabled by default
 - **WHEN** runtime is built with default features
@@ -86,7 +86,7 @@ The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, 
 
 #### Scenario: JIT diagnostics enabled
 - **WHEN** JIT diagnostics features are enabled for a build or test run
-- **THEN** the runtime can emit hot-loop detection, trace recording, replay, and side-exit events without changing default runtime behavior
+- **THEN** the runtime can emit hot-loop detection, trace recording, optimization, native code generation, replay, and side-exit events without changing default runtime behavior
 
 ### Requirement: JIT Replay Equivalence Tests
 The project MUST add JIT-focused tests that compare interpreter-only execution with M3 trace replay execution on the same hot loops.
@@ -108,3 +108,25 @@ The project MUST cover guard-failure side exits with regression tests that prove
 - **WHEN** a JIT replay test mutates value shape or type so that a recorded guard fails
 - **THEN** execution exits to the interpreter
 - **AND** the script still completes with interpreter-equivalent results
+
+### Requirement: Trace Optimizer Tests
+The project MUST add tests that verify optimization passes preserve observable trace semantics and leave unsupported trace regions safe for fallback execution.
+
+#### Scenario: Optimizer preserves supported trace behavior
+- **WHEN** an optimization pass rewrites a supported trace
+- **THEN** tests confirm the optimized trace produces the same observable behavior as the input trace
+
+#### Scenario: Unsupported region remains safe
+- **WHEN** a trace contains operations not rewritten by the optimizer
+- **THEN** tests confirm those regions remain intact or explicitly fall back without semantic drift
+
+### Requirement: x86_64 Backend Tests
+The project MUST add unit and integration tests that validate x86_64 code emission and native trace installation behavior.
+
+#### Scenario: Codegen unit coverage
+- **WHEN** backend unit tests are run on a development machine
+- **THEN** instruction encoding, executable buffer setup, and trace installation paths are validated
+
+#### Scenario: Native trace smoke execution
+- **WHEN** JIT smoke tests run on x86_64 with native backend enabled
+- **THEN** at least one supported hot-loop trace executes through the native path and matches interpreter-visible results
