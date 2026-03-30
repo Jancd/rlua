@@ -71,14 +71,14 @@ The project MUST provide automated checks for formatting, linting, and tests on 
 - **THEN** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` are executed
 
 ### Requirement: Layered Test Strategy
-The project MUST maintain test layering for unit, integration, differential, and JIT-specific validation.
+The project MUST maintain test layering for unit, integration, differential, JIT-specific validation, and benchmark-oriented validation.
 
 #### Scenario: Test tree inspection
 - **WHEN** repository tests are enumerated
-- **THEN** directories or modules exist for conformance, differential, JIT, and fuzz-oriented tests
+- **THEN** directories, modules, or documented harness entrypoints exist for conformance, differential, JIT, fuzz-oriented, and benchmark-oriented validation
 
 ### Requirement: Diagnostics Feature Flags
-The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, optimizer activity, native code generation, JIT counters, and replay/side-exit instrumentation.
+The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, optimizer activity, native code generation, deoptimization events, trace invalidation events, JIT counters, and replay/side-exit instrumentation.
 
 #### Scenario: Diagnostics disabled by default
 - **WHEN** runtime is built with default features
@@ -86,7 +86,7 @@ The runtime MUST support feature-gated diagnostics for trace logging, IR dumps, 
 
 #### Scenario: JIT diagnostics enabled
 - **WHEN** JIT diagnostics features are enabled for a build or test run
-- **THEN** the runtime can emit hot-loop detection, trace recording, optimization, native code generation, replay, and side-exit events without changing default runtime behavior
+- **THEN** the runtime can emit hot-loop detection, trace recording, optimization, native code generation, deoptimization, invalidation, replay, and side-exit events without changing default runtime behavior
 
 ### Requirement: JIT Replay Equivalence Tests
 The project MUST add JIT-focused tests that compare interpreter-only execution with M3 trace replay execution on the same hot loops.
@@ -108,6 +108,31 @@ The project MUST cover guard-failure side exits with regression tests that prove
 - **WHEN** a JIT replay test mutates value shape or type so that a recorded guard fails
 - **THEN** execution exits to the interpreter
 - **AND** the script still completes with interpreter-equivalent results
+
+### Requirement: Deoptimization and Invalidation Regression Tests
+The project MUST add regression tests that prove deoptimization and trace invalidation preserve interpreter-equivalent behavior for the M5-supported trace subset.
+
+#### Scenario: Native side exit resumes correctly
+- **WHEN** a JIT regression test forces a supported native side exit or guard failure
+- **THEN** execution resumes in the interpreter at the mapped bytecode location
+- **AND** the script completes with the same observable results as an interpreter-only run
+
+#### Scenario: Invalidated trace stays semantically safe
+- **WHEN** a regression test invalidates a cached trace and re-executes the same loop
+- **THEN** the runtime bypasses the invalidated trace
+- **AND** the script still completes with interpreter-equivalent results
+
+### Requirement: Benchmark Validation Gate
+The project MUST maintain a benchmark-driven validation path for the M5-supported JIT workload set.
+
+#### Scenario: Benchmark suite compares interpreter and JIT
+- **WHEN** the benchmark validation path is executed
+- **THEN** it runs the supported workload set in interpreter-only and JIT-enabled modes
+- **AND** it reports per-workload timings plus an aggregate median speedup
+
+#### Scenario: Speedup target is evaluated
+- **WHEN** M5 performance validation is reviewed
+- **THEN** the reported benchmark results can be used to determine whether the supported workload set meets the target median speedup versus interpreter baseline
 
 ### Requirement: Trace Optimizer Tests
 The project MUST add tests that verify optimization passes preserve observable trace semantics and leave unsupported trace regions safe for fallback execution.

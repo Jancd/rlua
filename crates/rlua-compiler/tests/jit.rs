@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rlua_ir::TraceDeoptExitKind;
 use rlua_jit::{ExecutionMode, NativeArtifactState};
 
 fn jit_path(name: &str) -> PathBuf {
@@ -13,17 +14,17 @@ fn jit_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn run_jit_case(name: &str, enabled: bool) -> (Vec<String>, Vec<String>, rlua_vm::VmJitDebugState) {
+fn run_jit_case_with_config(
+    name: &str,
+    config: rlua_jit::JitConfig,
+) -> (Vec<String>, Vec<String>, rlua_vm::VmJitDebugState) {
     let path = jit_path(name);
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let proto = rlua_compiler::compile_named(&source, path.to_str().unwrap())
         .unwrap_or_else(|e| panic!("{}: compile error: {e}", path.display()));
 
-    let mut state = rlua_vm::VmState::with_jit_config(rlua_jit::JitConfig {
-        enabled,
-        hot_threshold: 2,
-    });
+    let mut state = rlua_vm::VmState::with_jit_config(config);
     rlua_stdlib::register_stdlib(&mut state);
 
     let results = rlua_vm::execute(&mut state, proto)
@@ -32,6 +33,17 @@ fn run_jit_case(name: &str, enabled: bool) -> (Vec<String>, Vec<String>, rlua_vm
     let output = state.get_output().to_vec();
 
     (result_strings, output, state.jit_debug_state())
+}
+
+fn run_jit_case(name: &str, enabled: bool) -> (Vec<String>, Vec<String>, rlua_vm::VmJitDebugState) {
+    run_jit_case_with_config(
+        name,
+        rlua_jit::JitConfig {
+            enabled,
+            hot_threshold: 2,
+            ..rlua_jit::JitConfig::default()
+        },
+    )
 }
 
 fn assert_jit_matches_interpreter(name: &str) {
@@ -117,6 +129,30 @@ fn assert_fallback_trace_backend_state(name: &str) {
     );
 }
 
+fn assert_has_guard_deopt(name: &str, jit_debug: &rlua_vm::VmJitDebugState) {
+    assert!(
+        jit_debug.traces.iter().any(|trace| {
+            matches!(
+                trace.last_deopt.as_ref().map(|deopt| deopt.kind),
+                Some(TraceDeoptExitKind::Guard { .. })
+            )
+        }),
+        "expected guard deopt metadata for {name}"
+    );
+}
+
+fn assert_has_side_exit_deopt(name: &str, jit_debug: &rlua_vm::VmJitDebugState) {
+    assert!(
+        jit_debug.traces.iter().any(|trace| {
+            matches!(
+                trace.last_deopt.as_ref().map(|deopt| deopt.kind),
+                Some(TraceDeoptExitKind::SideExit { .. })
+            )
+        }),
+        "expected side-exit deopt metadata for {name}"
+    );
+}
+
 #[test]
 fn jit_numeric_sum_matches_interpreter() {
     assert_jit_matches_interpreter("numeric_sum.lua");
@@ -132,4 +168,50 @@ fn jit_numeric_descending_matches_interpreter() {
 #[test]
 fn jit_unsupported_table_loop_falls_back_without_drift() {
     assert_fallback_trace_backend_state("unsupported_table_loop.lua");
+}
+
+#[test]
+fn jit_native_side_exit_resume_matches_interpreter() {
+    let (jit_results, jit_output, jit_debug) = run_jit_case("native_side_exit_resume.lua", true);
+    let (interp_results, interp_output, _) = run_jit_case("native_side_exit_resume.lua", false);
+
+    assert_eq!(jit_results, interp_results);
+    assert_eq!(jit_output, interp_output);
+    assert_supported_trace_backend_state("native_side_exit_resume.lua");
+    assert!(jit_debug.stats.side_exits >= 1);
+    assert_has_side_exit_deopt("native_side_exit_resume.lua", &jit_debug);
+}
+
+#[test]
+fn jit_guard_exit_resumes_without_drift() {
+    let (jit_results, jit_output, jit_debug) = run_jit_case("guard_string_seed.lua", true);
+    let (interp_results, interp_output, _) = run_jit_case("guard_string_seed.lua", false);
+
+    assert_eq!(jit_results, interp_results);
+    assert_eq!(jit_output, interp_output);
+    assert_supported_trace_backend_state("guard_string_seed.lua");
+    assert!(jit_debug.stats.side_exits >= 1);
+    assert_has_guard_deopt("guard_string_seed.lua", &jit_debug);
+}
+
+#[test]
+fn jit_invalidated_trace_can_recompile_without_drift() {
+    let config = rlua_jit::JitConfig {
+        enabled: true,
+        hot_threshold: 2,
+        side_exit_threshold: 1,
+    };
+    let (jit_results, jit_output, jit_debug) =
+        run_jit_case_with_config("guard_invalidation_recovery.lua", config);
+    let (interp_results, interp_output, _) = run_jit_case("guard_invalidation_recovery.lua", false);
+
+    assert_eq!(jit_results, interp_results);
+    assert_eq!(jit_output, interp_output);
+    assert!(jit_debug.stats.side_exits >= 2);
+    assert!(jit_debug.stats.trace_invalidations >= 1);
+    assert!(jit_debug.stats.trace_recompiles >= 1);
+    assert!(
+        jit_debug.traces.iter().any(|trace| trace.generation >= 1),
+        "expected a replacement trace generation after invalidation"
+    );
 }

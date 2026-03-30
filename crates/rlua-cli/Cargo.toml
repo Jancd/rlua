@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rlua-core.workspace = true
 rlua-compiler.workspace = true
 rlua-jit.workspace = true
 rlua-vm.workspace = true

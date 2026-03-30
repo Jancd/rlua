@@ -23,17 +23,15 @@ impl X86_64TraceCompiler {
             ));
         };
 
-        let TraceStepKind::ForLoop {
-            base,
-            exit_resume_pc,
-        } = last.kind
-        else {
+        let TraceStepKind::ForLoop { base, .. } = last.kind else {
             return Err(JitError::UnsupportedTrace(
                 "native traces must terminate with a ForLoop back-edge".to_string(),
             ));
         };
 
         let mut emitter = Emitter::default();
+
+        let loop_start = emitter.position();
 
         for step in body {
             match step.kind {
@@ -56,13 +54,13 @@ impl X86_64TraceCompiler {
             }
         }
 
-        emitter.emit_numeric_for_loop(base);
+        emitter.emit_numeric_for_loop(base, loop_start);
 
         Ok(EncodedTrace {
             code: emitter.finish(),
             slot_count: trace.max_slot().map_or(0, |slot| slot as usize + 1),
             written_slots: trace.written_slots(),
-            side_exit_pc: exit_resume_pc,
+            side_exit_pc: last.source.pc,
         })
     }
 }
@@ -88,7 +86,7 @@ impl Emitter {
         self.emit_movsd_store(dst, 0);
     }
 
-    fn emit_numeric_for_loop(&mut self, base: u16) {
+    fn emit_numeric_for_loop(&mut self, base: u16, loop_start: usize) {
         let limit_slot = base + 1;
         let step_slot = base + 2;
         let visible_slot = base + 3;
@@ -120,8 +118,7 @@ impl Emitter {
         self.patch_rel32(positive_in_range_jump, in_range);
         self.emit_movsd_store(base, 0);
         self.emit_movsd_store(visible_slot, 0);
-        self.emit_xor_eax_eax();
-        self.emit_ret();
+        self.emit_jmp(loop_start);
     }
 
     fn emit_binary_mem(&mut self, op: ArithmeticOp, dst_xmm: u8, slot: u16) {
@@ -168,8 +165,11 @@ impl Emitter {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn emit_xor_eax_eax(&mut self) {
-        self.bytes.extend_from_slice(&[0x31, 0xC0]);
+    fn emit_jmp(&mut self, target: usize) {
+        self.bytes.push(0xE9);
+        let disp_offset = self.bytes.len();
+        self.bytes.extend_from_slice(&0i32.to_le_bytes());
+        self.patch_rel32(disp_offset, target);
     }
 
     fn emit_ret(&mut self) {
@@ -242,6 +242,7 @@ mod tests {
                     },
                 },
             ],
+            deopt_exits: Vec::new(),
             report: OptimizationReport::default(),
             native_supported: true,
         };
@@ -249,9 +250,10 @@ mod tests {
         let encoded = X86_64TraceCompiler::compile(&trace).unwrap();
 
         assert_eq!(encoded.slot_count, 5);
-        assert_eq!(encoded.side_exit_pc, 7);
+        assert_eq!(encoded.side_exit_pc, 6);
         assert_eq!(encoded.written_slots, vec![0, 1, 4]);
-        assert_eq!(encoded.code.last(), Some(&0xC3));
+        assert!(encoded.code.contains(&0xC3));
+        assert!(encoded.code.contains(&0xE9));
         assert!(
             encoded
                 .code
@@ -307,6 +309,7 @@ mod tests {
                     },
                 },
             ],
+            deopt_exits: Vec::new(),
             report: OptimizationReport::default(),
             native_supported: true,
         };
@@ -315,8 +318,9 @@ mod tests {
 
         assert_eq!(encoded.slot_count, 6);
         assert_eq!(encoded.written_slots, vec![0, 1, 4, 5]);
-        assert_eq!(encoded.side_exit_pc, 9);
-        assert_eq!(encoded.code.last(), Some(&0xC3));
+        assert_eq!(encoded.side_exit_pc, 8);
+        assert!(encoded.code.contains(&0xC3));
+        assert!(encoded.code.contains(&0xE9));
     }
 
     #[test]
@@ -338,6 +342,7 @@ mod tests {
                     rhs: TraceOperand::Slot(1),
                 },
             }],
+            deopt_exits: Vec::new(),
             report: OptimizationReport::default(),
             native_supported: false,
         };
