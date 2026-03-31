@@ -1,14 +1,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rlua_core::function::LuaFunction;
+use rlua_core::function::{CallOutcome, LuaFunction, NativeVmContext};
 use rlua_core::value::LuaValue;
 
 // ---------------------------------------------------------------------------
 // Basic string functions
 // ---------------------------------------------------------------------------
 
-pub fn lua_string_byte(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_byte(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "byte")?;
     let i = args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i64;
     let j = args.get(2).and_then(|v| v.to_number()).unwrap_or(i as f64) as i64;
@@ -22,10 +25,13 @@ pub fn lua_string_byte(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
             results.push(LuaValue::Number(bytes[idx as usize] as f64));
         }
     }
-    Ok(results)
+    ret(results)
 }
 
-pub fn lua_string_char(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_char(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let mut s = String::new();
     for (i, arg) in args.iter().enumerate() {
         let n = arg
@@ -34,39 +40,57 @@ pub fn lua_string_char(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
             as u32;
         s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
     }
-    Ok(vec![LuaValue::from(s)])
+    ret(vec![LuaValue::from(s)])
 }
 
-pub fn lua_string_len(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_len(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "len")?;
-    Ok(vec![LuaValue::Number(s.len() as f64)])
+    ret(vec![LuaValue::Number(s.len() as f64)])
 }
 
-pub fn lua_string_lower(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_lower(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "lower")?;
-    Ok(vec![LuaValue::from(s.to_lowercase())])
+    ret(vec![LuaValue::from(s.to_lowercase())])
 }
 
-pub fn lua_string_upper(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_upper(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "upper")?;
-    Ok(vec![LuaValue::from(s.to_uppercase())])
+    ret(vec![LuaValue::from(s.to_uppercase())])
 }
 
-pub fn lua_string_reverse(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_reverse(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "reverse")?;
-    Ok(vec![LuaValue::from(s.chars().rev().collect::<String>())])
+    ret(vec![LuaValue::from(s.chars().rev().collect::<String>())])
 }
 
-pub fn lua_string_rep(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_rep(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "rep")?;
     let n = args
         .get(1)
         .and_then(|v| v.to_number())
         .ok_or("bad argument #2 to 'rep' (number expected)")? as usize;
-    Ok(vec![LuaValue::from(s.repeat(n))])
+    ret(vec![LuaValue::from(s.repeat(n))])
 }
 
-pub fn lua_string_sub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_sub(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "sub")?;
     let len = s.len() as i64;
     let i = args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i64;
@@ -75,13 +99,16 @@ pub fn lua_string_sub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     let end = (lua_index(j, len) + 1).max(0) as usize;
     let end = end.min(s.len());
     if start >= end {
-        Ok(vec![LuaValue::from("")])
+        ret(vec![LuaValue::from("")])
     } else {
-        Ok(vec![LuaValue::from(&s[start..end])])
+        ret(vec![LuaValue::from(&s[start..end])])
     }
 }
 
-pub fn lua_string_find(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_find(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "find")?;
     let pattern = get_str_idx(args, 2, "find")?;
     let init = args.get(2).and_then(|v| v.to_number()).unwrap_or(1.0) as i64;
@@ -93,12 +120,12 @@ pub fn lua_string_find(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         // Plain string search
         if let Some(pos) = s[start..].find(&*pattern) {
             let abs_start = start + pos;
-            Ok(vec![
+            ret(vec![
                 LuaValue::Number((abs_start + 1) as f64),
                 LuaValue::Number((abs_start + pattern.len()) as f64),
             ])
         } else {
-            Ok(vec![LuaValue::Nil])
+            ret(vec![LuaValue::Nil])
         }
     } else {
         // Pattern search
@@ -111,14 +138,17 @@ pub fn lua_string_find(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
                 for cap in &m.captures {
                     results.push(LuaValue::from(&s[cap.0..cap.1]));
                 }
-                Ok(results)
+                ret(results)
             }
-            None => Ok(vec![LuaValue::Nil]),
+            None => ret(vec![LuaValue::Nil]),
         }
     }
 }
 
-pub fn lua_string_match(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_match(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "match")?;
     let pattern = get_str_idx(args, 2, "match")?;
     let init = args.get(2).and_then(|v| v.to_number()).unwrap_or(1.0) as i64;
@@ -128,19 +158,23 @@ pub fn lua_string_match(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     match pattern_match(&s, &pattern, start) {
         Some(m) => {
             if m.captures.is_empty() {
-                Ok(vec![LuaValue::from(&s[m.start..m.end])])
+                ret(vec![LuaValue::from(&s[m.start..m.end])])
             } else {
-                Ok(m.captures
+                ret(m
+                    .captures
                     .iter()
                     .map(|(a, b)| LuaValue::from(&s[*a..*b]))
                     .collect())
             }
         }
-        None => Ok(vec![LuaValue::Nil]),
+        None => ret(vec![LuaValue::Nil]),
     }
 }
 
-pub fn lua_string_gmatch(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_gmatch(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "gmatch")?;
     let pattern = get_str_idx(args, 2, "gmatch")?;
 
@@ -193,7 +227,7 @@ pub fn lua_string_gmatch(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         .rawset(LuaValue::from("__pos"), LuaValue::Number(0.0));
 
     // Return iterator function, matches_table, initial control (nil — unused)
-    Ok(vec![
+    ret(vec![
         LuaValue::Function(Rc::new(LuaFunction::Native {
             name: "__gmatch_iter",
             func: gmatch_iterator,
@@ -203,10 +237,13 @@ pub fn lua_string_gmatch(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     ])
 }
 
-fn gmatch_iterator(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn gmatch_iterator(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let table = match args.first() {
         Some(LuaValue::Table(t)) => t.clone(),
-        _ => return Ok(vec![LuaValue::Nil]),
+        _ => return ret(vec![LuaValue::Nil]),
     };
 
     // Read and advance the position stored in the state table
@@ -228,13 +265,16 @@ fn gmatch_iterator(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
             for i in 1..=len {
                 results.push(data.rawget(&LuaValue::Number(i as f64)));
             }
-            Ok(results)
+            ret(results)
         }
-        _ => Ok(vec![LuaValue::Nil]),
+        _ => ret(vec![LuaValue::Nil]),
     }
 }
 
-pub fn lua_string_gsub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_gsub(
+    ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let s = get_str(args, "gsub")?;
     let pattern = get_str_idx(args, 2, "gsub")?;
     let repl = args.get(2).cloned().unwrap_or(LuaValue::from(""));
@@ -293,9 +333,8 @@ pub fn lua_string_gsub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
                                 .map(|(a, b)| LuaValue::from(&s[*a..*b]))
                                 .collect()
                         };
-                        match f.as_ref() {
-                            LuaFunction::Native { func, .. } => {
-                                let res = func(&match_str)?;
+                        match ctx.call_function(&LuaValue::Function(f.clone()), &match_str) {
+                            Ok(res) => {
                                 let val = res.first().cloned().unwrap_or(LuaValue::Nil);
                                 if val.is_truthy() {
                                     result.push_str(&val.to_lua_string());
@@ -303,10 +342,7 @@ pub fn lua_string_gsub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
                                     result.push_str(&s[m.start..m.end]);
                                 }
                             }
-                            _ => {
-                                // For Lua functions, fall back to matched string
-                                result.push_str(&s[m.start..m.end]);
-                            }
+                            Err(err) => return Err(err),
                         }
                     }
                     LuaValue::Table(t) => {
@@ -351,10 +387,13 @@ pub fn lua_string_gsub(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         result.push_str(&s[start..]);
     }
 
-    Ok(vec![LuaValue::from(result), LuaValue::Number(count as f64)])
+    ret(vec![LuaValue::from(result), LuaValue::Number(count as f64)])
 }
 
-pub fn lua_string_format(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+pub fn lua_string_format(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let fmt = get_str(args, "format")?;
     let mut result = String::new();
     let mut arg_idx = 1;
@@ -539,7 +578,7 @@ pub fn lua_string_format(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         }
     }
 
-    Ok(vec![LuaValue::from(result)])
+    ret(vec![LuaValue::from(result)])
 }
 
 fn format_g(n: f64) -> String {
@@ -873,6 +912,10 @@ fn find_open_capture(captures: &[(usize, usize)]) -> Option<usize> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn ret(values: Vec<LuaValue>) -> Result<CallOutcome, String> {
+    Ok(CallOutcome::Return(values))
+}
+
 fn get_str(args: &[LuaValue], name: &str) -> Result<String, String> {
     match args.first() {
         Some(LuaValue::String(s)) => Ok((**s).clone()),
@@ -917,6 +960,15 @@ fn lua_index(i: i64, len: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rlua_vm::VmState;
+
+    fn test_call(func: rlua_core::NativeFn, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+        let mut state = VmState::new();
+        match func(&mut state, args)? {
+            CallOutcome::Return(values) => Ok(values),
+            CallOutcome::Yield(_) => Err("unexpected yield in string stdlib test".to_owned()),
+        }
+    }
 
     #[test]
     fn test_pattern_simple() {
@@ -957,18 +1009,25 @@ mod tests {
 
     #[test]
     fn test_sub() {
-        let r = lua_string_sub(&[
-            LuaValue::from("hello"),
-            LuaValue::Number(2.0),
-            LuaValue::Number(4.0),
-        ])
+        let r = test_call(
+            lua_string_sub,
+            &[
+                LuaValue::from("hello"),
+                LuaValue::Number(2.0),
+                LuaValue::Number(4.0),
+            ],
+        )
         .unwrap();
         assert_eq!(r[0], LuaValue::from("ell"));
     }
 
     #[test]
     fn test_sub_negative() {
-        let r = lua_string_sub(&[LuaValue::from("hello"), LuaValue::Number(-3.0)]).unwrap();
+        let r = test_call(
+            lua_string_sub,
+            &[LuaValue::from("hello"), LuaValue::Number(-3.0)],
+        )
+        .unwrap();
         assert_eq!(r[0], LuaValue::from("llo"));
     }
 }

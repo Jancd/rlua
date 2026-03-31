@@ -122,3 +122,7 @@ fn integration() {
 fn gc_stress() {
     run_lua_file(&conformance_path("gc_stress.lua"));
 }
+#[test]
+fn coroutine() {
+    run_lua_file(&conformance_path("coroutine.lua"));
+}

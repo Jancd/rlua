@@ -34,6 +34,19 @@ local d = {5, 3, 1, 4, 2}
 table.sort(d)
 print(d[1], d[2], d[3], d[4], d[5])
 
+local desc = {5, 3, 1, 4, 2}
+table.sort(desc, function(a, b)
+    return a > b
+end)
+print(desc[1], desc[2], desc[3], desc[4], desc[5])
+
+local ok, err = pcall(function()
+    table.sort({3, 2, 1}, function(a, b)
+        error("cmp boom")
+    end)
+end)
+print(ok, string.find(err, "cmp boom") ~= nil)
+
 -- pairs iteration (sorted output for determinism)
 local keys = {}
 local vals = {}

@@ -1,3 +1,4 @@
+mod coroutine_lib;
 mod math;
 mod string_lib;
 mod table_lib;
@@ -5,7 +6,7 @@ mod table_lib;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rlua_core::function::LuaFunction;
+use rlua_core::function::{CallOutcome, LuaFunction, NativeVmContext};
 use rlua_core::table::LuaTable;
 use rlua_core::value::LuaValue;
 use rlua_vm::VmState;
@@ -38,6 +39,7 @@ pub fn register_stdlib(state: &mut VmState) {
 
     // Register module tables
     register_math_lib(state);
+    register_coroutine_lib(state);
     register_table_lib(state);
     register_string_lib(state);
 }
@@ -129,6 +131,41 @@ fn register_math_lib(state: &mut VmState) {
         .globals()
         .borrow_mut()
         .rawset(LuaValue::from("math"), LuaValue::Table(t));
+}
+
+fn register_coroutine_lib(state: &mut VmState) {
+    let t = Rc::new(RefCell::new(LuaTable::new()));
+    {
+        let mut mt = t.borrow_mut();
+        mt.rawset(
+            LuaValue::from("create"),
+            make_native("coroutine.create", coroutine_lib::lua_coroutine_create),
+        );
+        mt.rawset(
+            LuaValue::from("resume"),
+            make_native("coroutine.resume", coroutine_lib::lua_coroutine_resume),
+        );
+        mt.rawset(
+            LuaValue::from("yield"),
+            make_native("coroutine.yield", coroutine_lib::lua_coroutine_yield),
+        );
+        mt.rawset(
+            LuaValue::from("running"),
+            make_native("coroutine.running", coroutine_lib::lua_coroutine_running),
+        );
+        mt.rawset(
+            LuaValue::from("status"),
+            make_native("coroutine.status", coroutine_lib::lua_coroutine_status),
+        );
+        mt.rawset(
+            LuaValue::from("wrap"),
+            make_native("coroutine.wrap", coroutine_lib::lua_coroutine_wrap),
+        );
+    }
+    state
+        .globals()
+        .borrow_mut()
+        .rawset(LuaValue::from("coroutine"), LuaValue::Table(t));
 }
 
 fn register_table_lib(state: &mut VmState) {
@@ -233,51 +270,52 @@ fn register_string_lib(state: &mut VmState) {
 // Global functions
 // ---------------------------------------------------------------------------
 
-fn lua_print(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_print(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let parts: Vec<String> = args.iter().map(|v| v.to_lua_string()).collect();
     println!("{}", parts.join("\t"));
-    Ok(Vec::new())
+    ret(Vec::new())
 }
 
-fn lua_type(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_type(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let val = args.first().unwrap_or(&LuaValue::Nil);
-    Ok(vec![LuaValue::from(val.type_name())])
+    ret(vec![LuaValue::from(val.type_name())])
 }
 
-fn lua_tostring(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_tostring(ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let val = args.first().unwrap_or(&LuaValue::Nil);
-    // Check for __tostring metamethod
     if let LuaValue::Table(t) = val
-        && let Some(LuaValue::Function(f)) = t.borrow().get_metamethod("__tostring")
-        && let LuaFunction::Native { func, .. } = f.as_ref()
+        && let Some(mm) = t.borrow().get_metamethod("__tostring")
     {
-        return func(std::slice::from_ref(val));
+        let results = ctx.call_function(&mm, std::slice::from_ref(val))?;
+        let out = results.first().cloned().unwrap_or(LuaValue::Nil);
+        return match out {
+            LuaValue::String(_) | LuaValue::Number(_) => {
+                ret(vec![LuaValue::from(out.to_lua_string())])
+            }
+            _ => Err("'__tostring' must return a string".to_owned()),
+        };
     }
-    Ok(vec![LuaValue::from(val.to_lua_string())])
+    ret(vec![LuaValue::from(val.to_lua_string())])
 }
 
-fn lua_tonumber(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_tonumber(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let val = args.first().unwrap_or(&LuaValue::Nil);
     match val.to_number() {
-        Some(n) => Ok(vec![LuaValue::Number(n)]),
-        None => Ok(vec![LuaValue::Nil]),
+        Some(n) => ret(vec![LuaValue::Number(n)]),
+        None => ret(vec![LuaValue::Nil]),
     }
 }
 
-fn lua_error(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_error(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let msg = args.first().unwrap_or(&LuaValue::Nil);
     let _level = args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i32;
-    // In Lua 5.1, level controls where the error position is reported.
-    // Level 0 = no position, level 1 = caller, level 2 = caller's caller.
-    // Since we don't have call stack access from native functions, we pass
-    // the message as-is. The VM could add source location in the future.
     Err(msg.to_lua_string())
 }
 
-fn lua_assert(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_assert(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let val = args.first().unwrap_or(&LuaValue::Nil);
     if val.is_truthy() {
-        Ok(args.to_vec())
+        ret(args.to_vec())
     } else {
         let msg = args
             .get(1)
@@ -287,13 +325,13 @@ fn lua_assert(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_rawget(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_rawget(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'rawget' (table expected)")?;
     let key = args.get(1).unwrap_or(&LuaValue::Nil);
     match table {
-        LuaValue::Table(t) => Ok(vec![t.borrow().rawget(key)]),
+        LuaValue::Table(t) => ret(vec![t.borrow().rawget(key)]),
         _ => Err(format!(
             "bad argument #1 to 'rawget' (table expected, got {})",
             table.type_name()
@@ -301,7 +339,7 @@ fn lua_rawget(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_rawset(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_rawset(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'rawset' (table expected)")?;
@@ -310,7 +348,7 @@ fn lua_rawset(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     match table {
         LuaValue::Table(t) => {
             t.borrow_mut().rawset(key, val);
-            Ok(vec![table.clone()])
+            ret(vec![table.clone()])
         }
         _ => Err(format!(
             "bad argument #1 to 'rawset' (table expected, got {})",
@@ -319,16 +357,16 @@ fn lua_rawset(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_rawequal(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_rawequal(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let a = args.first().unwrap_or(&LuaValue::Nil);
     let b = args.get(1).unwrap_or(&LuaValue::Nil);
-    Ok(vec![LuaValue::Boolean(a == b)])
+    ret(vec![LuaValue::Boolean(a == b)])
 }
 
-fn lua_rawlen(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_rawlen(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     match args.first().unwrap_or(&LuaValue::Nil) {
-        LuaValue::Table(t) => Ok(vec![LuaValue::Number(t.borrow().len() as f64)]),
-        LuaValue::String(s) => Ok(vec![LuaValue::Number(s.len() as f64)]),
+        LuaValue::Table(t) => ret(vec![LuaValue::Number(t.borrow().len() as f64)]),
+        LuaValue::String(s) => ret(vec![LuaValue::Number(s.len() as f64)]),
         other => Err(format!(
             "bad argument #1 to 'rawlen' (table or string expected, got {})",
             other.type_name()
@@ -336,15 +374,15 @@ fn lua_rawlen(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_next(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_next(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'next' (table expected)")?;
     let key = args.get(1).unwrap_or(&LuaValue::Nil);
     match table {
         LuaValue::Table(t) => match t.borrow().next(key) {
-            Some((k, v)) => Ok(vec![k, v]),
-            None => Ok(vec![LuaValue::Nil]),
+            Some((k, v)) => ret(vec![k, v]),
+            None => ret(vec![LuaValue::Nil]),
         },
         _ => Err(format!(
             "bad argument #1 to 'next' (table expected, got {})",
@@ -353,12 +391,12 @@ fn lua_next(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_select(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_select(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let index = args.first().unwrap_or(&LuaValue::Nil);
     match index {
         LuaValue::String(s) if s.as_str() == "#" => {
             let count = if args.len() > 1 { args.len() - 1 } else { 0 };
-            Ok(vec![LuaValue::Number(count as f64)])
+            ret(vec![LuaValue::Number(count as f64)])
         }
         _ => {
             let n = index
@@ -378,12 +416,12 @@ fn lua_select(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
                 }
                 n as usize
             };
-            Ok(args[idx..].to_vec())
+            ret(args[idx..].to_vec())
         }
     }
 }
 
-fn lua_unpack(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_unpack(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'unpack' (table expected)")?;
@@ -395,7 +433,7 @@ fn lua_unpack(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
             for i in 1..=len {
                 results.push(t.rawget(&LuaValue::Number(i as f64)));
             }
-            Ok(results)
+            ret(results)
         }
         _ => Err(format!(
             "bad argument #1 to 'unpack' (table expected, got {})",
@@ -404,12 +442,12 @@ fn lua_unpack(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_pairs(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_pairs(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'pairs' (table expected)")?;
     match table {
-        LuaValue::Table(_) => Ok(vec![
+        LuaValue::Table(_) => ret(vec![
             LuaValue::Function(Rc::new(LuaFunction::Native {
                 name: "next",
                 func: lua_next,
@@ -425,16 +463,19 @@ fn lua_pairs(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
 }
 
 /// pcall is handled specially by the VM's CALL handler.
-fn lua_pcall(_args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_pcall(_ctx: &mut dyn NativeVmContext, _args: &[LuaValue]) -> Result<CallOutcome, String> {
     Err("pcall: internal error — should be handled by VM".to_owned())
 }
 
 /// xpcall is handled specially by the VM's CALL handler.
-fn lua_xpcall(_args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_xpcall(_ctx: &mut dyn NativeVmContext, _args: &[LuaValue]) -> Result<CallOutcome, String> {
     Err("xpcall: internal error — should be handled by VM".to_owned())
 }
 
-fn lua_setmetatable(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_setmetatable(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'setmetatable' (table expected)")?;
@@ -459,7 +500,7 @@ fn lua_setmetatable(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
                     );
                 }
             }
-            Ok(vec![table.clone()])
+            ret(vec![table.clone()])
         }
         _ => Err(format!(
             "bad argument #1 to 'setmetatable' (table expected, got {})",
@@ -468,29 +509,32 @@ fn lua_setmetatable(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn lua_getmetatable(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_getmetatable(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let val = args.first().unwrap_or(&LuaValue::Nil);
     match val {
         LuaValue::Table(t) => {
             // Check for __metatable field first
             if let Some(mm) = t.borrow().get_metamethod("__metatable") {
-                return Ok(vec![mm]);
+                return ret(vec![mm]);
             }
             match t.borrow().metatable() {
-                Some(mt) => Ok(vec![LuaValue::Table(mt.clone())]),
-                None => Ok(vec![LuaValue::Nil]),
+                Some(mt) => ret(vec![LuaValue::Table(mt.clone())]),
+                None => ret(vec![LuaValue::Nil]),
             }
         }
-        _ => Ok(vec![LuaValue::Nil]),
+        _ => ret(vec![LuaValue::Nil]),
     }
 }
 
-fn lua_ipairs(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn lua_ipairs(_ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String> {
     let table = args
         .first()
         .ok_or("bad argument #1 to 'ipairs' (table expected)")?;
     match table {
-        LuaValue::Table(_) => Ok(vec![
+        LuaValue::Table(_) => ret(vec![
             LuaValue::Function(Rc::new(LuaFunction::Native {
                 name: "__ipairs_iter",
                 func: ipairs_iterator,
@@ -505,7 +549,10 @@ fn lua_ipairs(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
     }
 }
 
-fn ipairs_iterator(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+fn ipairs_iterator(
+    _ctx: &mut dyn NativeVmContext,
+    args: &[LuaValue],
+) -> Result<CallOutcome, String> {
     let table = args.first().unwrap_or(&LuaValue::Nil);
     let index = args.get(1).and_then(|v| v.to_number()).unwrap_or(0.0);
     let next_index = index + 1.0;
@@ -513,13 +560,17 @@ fn ipairs_iterator(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         LuaValue::Table(t) => {
             let val = t.borrow().rawget(&LuaValue::Number(next_index));
             if val == LuaValue::Nil {
-                Ok(vec![LuaValue::Nil])
+                ret(vec![LuaValue::Nil])
             } else {
-                Ok(vec![LuaValue::Number(next_index), val])
+                ret(vec![LuaValue::Number(next_index), val])
             }
         }
-        _ => Ok(vec![LuaValue::Nil]),
+        _ => ret(vec![LuaValue::Nil]),
     }
+}
+
+fn ret(values: Vec<LuaValue>) -> Result<CallOutcome, String> {
+    Ok(CallOutcome::Return(values))
 }
 
 #[cfg(test)]
@@ -528,18 +579,26 @@ mod tests {
     use rlua_core::table::LuaTable;
     use std::cell::RefCell;
 
+    fn test_call(func: rlua_core::NativeFn, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+        let mut state = VmState::new();
+        match func(&mut state, args)? {
+            CallOutcome::Return(values) => Ok(values),
+            CallOutcome::Yield(_) => Err("unexpected yield in stdlib unit test".to_owned()),
+        }
+    }
+
     #[test]
     fn test_type() {
         assert_eq!(
-            lua_type(&[LuaValue::Number(1.0)]).unwrap(),
+            test_call(lua_type, &[LuaValue::Number(1.0)]).unwrap(),
             vec![LuaValue::from("number")]
         );
         assert_eq!(
-            lua_type(&[LuaValue::Nil]).unwrap(),
+            test_call(lua_type, &[LuaValue::Nil]).unwrap(),
             vec![LuaValue::from("nil")]
         );
         assert_eq!(
-            lua_type(&[LuaValue::from("hello")]).unwrap(),
+            test_call(lua_type, &[LuaValue::from("hello")]).unwrap(),
             vec![LuaValue::from("string")]
         );
     }
@@ -547,11 +606,11 @@ mod tests {
     #[test]
     fn test_tostring() {
         assert_eq!(
-            lua_tostring(&[LuaValue::Number(42.0)]).unwrap(),
+            test_call(lua_tostring, &[LuaValue::Number(42.0)]).unwrap(),
             vec![LuaValue::from("42")]
         );
         assert_eq!(
-            lua_tostring(&[LuaValue::Boolean(true)]).unwrap(),
+            test_call(lua_tostring, &[LuaValue::Boolean(true)]).unwrap(),
             vec![LuaValue::from("true")]
         );
     }
@@ -559,54 +618,66 @@ mod tests {
     #[test]
     fn test_tonumber() {
         assert_eq!(
-            lua_tonumber(&[LuaValue::from("42")]).unwrap(),
+            test_call(lua_tonumber, &[LuaValue::from("42")]).unwrap(),
             vec![LuaValue::Number(42.0)]
         );
         assert_eq!(
-            lua_tonumber(&[LuaValue::from("hello")]).unwrap(),
+            test_call(lua_tonumber, &[LuaValue::from("hello")]).unwrap(),
             vec![LuaValue::Nil]
         );
     }
 
     #[test]
     fn test_assert_success() {
-        let result = lua_assert(&[LuaValue::Boolean(true), LuaValue::from("msg")]);
+        let result = test_call(
+            lua_assert,
+            &[LuaValue::Boolean(true), LuaValue::from("msg")],
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_assert_failure() {
-        let result = lua_assert(&[LuaValue::Boolean(false), LuaValue::from("oops")]);
+        let result = test_call(
+            lua_assert,
+            &[LuaValue::Boolean(false), LuaValue::from("oops")],
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "oops");
     }
 
     #[test]
     fn test_error() {
-        let result = lua_error(&[LuaValue::from("boom")]);
+        let result = test_call(lua_error, &[LuaValue::from("boom")]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "boom");
     }
 
     #[test]
     fn test_select_index() {
-        let result = lua_select(&[
-            LuaValue::Number(2.0),
-            LuaValue::from("a"),
-            LuaValue::from("b"),
-            LuaValue::from("c"),
-        ])
+        let result = test_call(
+            lua_select,
+            &[
+                LuaValue::Number(2.0),
+                LuaValue::from("a"),
+                LuaValue::from("b"),
+                LuaValue::from("c"),
+            ],
+        )
         .unwrap();
         assert_eq!(result, vec![LuaValue::from("b"), LuaValue::from("c")]);
     }
 
     #[test]
     fn test_select_count() {
-        let result = lua_select(&[
-            LuaValue::from("#"),
-            LuaValue::Number(1.0),
-            LuaValue::Number(2.0),
-        ])
+        let result = test_call(
+            lua_select,
+            &[
+                LuaValue::from("#"),
+                LuaValue::Number(1.0),
+                LuaValue::Number(2.0),
+            ],
+        )
         .unwrap();
         assert_eq!(result, vec![LuaValue::Number(2.0)]);
     }
@@ -615,8 +686,12 @@ mod tests {
     fn test_rawget_rawset() {
         let t = Rc::new(RefCell::new(LuaTable::new()));
         let table = LuaValue::Table(t);
-        lua_rawset(&[table.clone(), LuaValue::from("key"), LuaValue::Number(99.0)]).unwrap();
-        let result = lua_rawget(&[table, LuaValue::from("key")]).unwrap();
+        test_call(
+            lua_rawset,
+            &[table.clone(), LuaValue::from("key"), LuaValue::Number(99.0)],
+        )
+        .unwrap();
+        let result = test_call(lua_rawget, &[table, LuaValue::from("key")]).unwrap();
         assert_eq!(result, vec![LuaValue::Number(99.0)]);
     }
 
@@ -629,7 +704,7 @@ mod tests {
             .rawset(LuaValue::Number(2.0), LuaValue::from("b"));
         t.borrow_mut()
             .rawset(LuaValue::Number(3.0), LuaValue::from("c"));
-        let result = lua_unpack(&[LuaValue::Table(t)]).unwrap();
+        let result = test_call(lua_unpack, &[LuaValue::Table(t)]).unwrap();
         assert_eq!(
             result,
             vec![
@@ -647,8 +722,8 @@ mod tests {
         let table = LuaValue::Table(t);
         let metatable = LuaValue::Table(mt);
 
-        lua_setmetatable(&[table.clone(), metatable.clone()]).unwrap();
-        let result = lua_getmetatable(&[table]).unwrap();
+        test_call(lua_setmetatable, &[table.clone(), metatable.clone()]).unwrap();
+        let result = test_call(lua_getmetatable, &[table]).unwrap();
         assert_eq!(result.len(), 1);
         // Should return the metatable
         assert!(matches!(result[0], LuaValue::Table(_)));
@@ -663,11 +738,11 @@ mod tests {
         t.borrow_mut().set_metatable(Some(mt));
         let table = LuaValue::Table(t);
         // getmetatable should return __metatable value
-        let result = lua_getmetatable(std::slice::from_ref(&table)).unwrap();
+        let result = test_call(lua_getmetatable, std::slice::from_ref(&table)).unwrap();
         assert_eq!(result[0], LuaValue::from("protected"));
         // setmetatable should fail
         let new_mt = Rc::new(RefCell::new(LuaTable::new()));
-        let result = lua_setmetatable(&[table, LuaValue::Table(new_mt)]);
+        let result = test_call(lua_setmetatable, &[table, LuaValue::Table(new_mt)]);
         assert!(result.is_err());
     }
 }

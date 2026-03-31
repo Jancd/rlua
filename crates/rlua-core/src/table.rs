@@ -207,6 +207,8 @@ fn lua_raw_equal(a: &LuaValue, b: &LuaValue) -> bool {
         (LuaValue::Number(a), LuaValue::Number(b)) => a == b,
         (LuaValue::String(a), LuaValue::String(b)) => a == b,
         (LuaValue::Table(a), LuaValue::Table(b)) => Rc::ptr_eq(a, b),
+        (LuaValue::Function(a), LuaValue::Function(b)) => Rc::ptr_eq(a, b),
+        (LuaValue::Thread(a), LuaValue::Thread(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }

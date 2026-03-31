@@ -133,3 +133,8 @@ fn diff_metatables() {
 fn diff_error_handling() {
     run_differential_test("error_handling.lua");
 }
+
+#[test]
+fn diff_coroutine() {
+    run_differential_test("coroutine.lua");
+}

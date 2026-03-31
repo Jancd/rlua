@@ -30,11 +30,13 @@ print(proxy.x, proxy.y)
 table.sort(log)
 print(table.concat(log, ", "))
 
--- __tostring (using native print which calls tostring internally)
--- Note: tostring() with Lua closure __tostring is a known limitation,
--- so we test it differently by printing the fields directly
-local point = {x = 3, y = 4}
-print("(" .. point.x .. ", " .. point.y .. ")")
+-- __tostring with Lua closure
+local point = setmetatable({x = 3, y = 4}, {
+    __tostring = function(self)
+        return "Point(" .. self.x .. ", " .. self.y .. ")"
+    end
+})
+print(tostring(point))
 
 -- __len (skipped in differential test: LuaJIT doesn't support __len on tables,
 -- standard Lua 5.1 does. Tested in conformance tests instead.)

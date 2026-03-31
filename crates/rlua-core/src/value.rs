@@ -4,6 +4,11 @@ use std::rc::Rc;
 use crate::function::LuaFunction;
 use crate::table::TableRef;
 
+#[derive(Debug, Default)]
+pub struct LuaThread;
+
+pub type ThreadRef = Rc<LuaThread>;
+
 #[derive(Debug, Clone)]
 pub enum LuaValue {
     Nil,
@@ -12,6 +17,7 @@ pub enum LuaValue {
     String(Rc<String>),
     Table(TableRef),
     Function(Rc<LuaFunction>),
+    Thread(ThreadRef),
 }
 
 impl LuaValue {
@@ -23,6 +29,7 @@ impl LuaValue {
             Self::String(_) => "string",
             Self::Table(_) => "table",
             Self::Function(_) => "function",
+            Self::Thread(_) => "thread",
         }
     }
 
@@ -59,6 +66,7 @@ impl LuaValue {
             Self::String(s) => (**s).clone(),
             Self::Table(t) => format!("table: {:p}", Rc::as_ptr(t)),
             Self::Function(f) => format!("{f:?}"),
+            Self::Thread(thread) => format!("thread: {:p}", Rc::as_ptr(thread)),
         }
     }
 }
@@ -141,6 +149,7 @@ impl PartialEq for LuaValue {
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Table(a), Self::Table(b)) => Rc::ptr_eq(a, b),
             (Self::Function(a), Self::Function(b)) => Rc::ptr_eq(a, b),
+            (Self::Thread(a), Self::Thread(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -206,6 +215,7 @@ mod tests {
         assert_eq!(LuaValue::Boolean(true).type_name(), "boolean");
         assert_eq!(LuaValue::Number(1.0).type_name(), "number");
         assert_eq!(LuaValue::from("s").type_name(), "string");
+        assert_eq!(LuaValue::Thread(Rc::new(LuaThread)).type_name(), "thread");
     }
 
     #[test]
@@ -222,5 +232,7 @@ mod tests {
         assert_eq!(LuaValue::Number(1.0), LuaValue::Number(1.0));
         assert_eq!(LuaValue::from("a"), LuaValue::from("a"));
         assert_ne!(LuaValue::Number(1.0), LuaValue::from("1"));
+        let thread = Rc::new(LuaThread);
+        assert_eq!(LuaValue::Thread(thread.clone()), LuaValue::Thread(thread));
     }
 }

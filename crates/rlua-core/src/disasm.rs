@@ -260,6 +260,7 @@ fn format_constant(val: &LuaValue) -> String {
         LuaValue::String(s) => format!("{s:?}"),
         LuaValue::Table(_) => "table".to_owned(),
         LuaValue::Function(_) => "function".to_owned(),
+        LuaValue::Thread(_) => "thread".to_owned(),
     }
 }
 

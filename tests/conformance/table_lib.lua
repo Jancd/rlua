@@ -46,8 +46,30 @@ local s2 = {"banana", "apple", "cherry"}
 table.sort(s2)
 assert(s2[1] == "apple" and s2[2] == "banana" and s2[3] == "cherry", "sort string")
 
--- table.sort with comparator (native function not available for Lua comparators,
--- so we test default sort only)
+-- table.sort with Lua comparator
+local s5 = {5, 3, 1, 4, 2}
+table.sort(s5, function(a, b)
+    return a > b
+end)
+assert(s5[1] == 5 and s5[2] == 4 and s5[3] == 3 and s5[4] == 2 and s5[5] == 1, "sort comparator")
+
+local ok, err = pcall(function()
+    table.sort({3, 2, 1}, function(a, b)
+        error("cmp boom")
+    end)
+end)
+assert(ok == false, "sort comparator errors propagate")
+assert(string.find(err, "cmp boom"), "sort comparator error message")
+
+local yield_ok, yield_err = coroutine.resume(coroutine.create(function()
+    local values = {3, 2, 1}
+    table.sort(values, function(a, b)
+        coroutine.yield("blocked")
+        return a < b
+    end)
+end))
+assert(yield_ok == false, "sort comparator yield across native boundary errors")
+assert(string.find(yield_err, "native callback boundary"), "sort comparator yield boundary message")
 
 -- table.sort single element
 local s3 = {42}
