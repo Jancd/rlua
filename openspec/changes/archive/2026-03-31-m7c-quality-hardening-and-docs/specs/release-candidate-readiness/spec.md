@@ -1,6 +1,4 @@
-## Capability: release-candidate-readiness (NEW)
-
-M6 packages the supported interpreter and tracing-JIT subset into an explicit release-candidate deliverable with versioned limitation reporting and repeatable validation guidance.
+## MODIFIED Requirements
 
 ### Requirement: Release Candidate Scope Documentation
 The project MUST provide versioned, repository-visible release-candidate documentation that describes the supported runtime and JIT subset for `v1.0.0-rc`.

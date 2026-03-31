@@ -1,14 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
-echo "[rc] validating openspec change"
-openspec validate m6-release-candidate --type change --strict
+echo "[rc] running required validation"
+sh scripts/validate-required.sh
 
-echo "[rc] running clippy"
-cargo clippy --workspace --all-targets -- -D warnings
-
-echo "[rc] running workspace tests"
-cargo test --workspace
+echo "[rc] running extended hardening validation"
+sh scripts/validate-hardening.sh
 
 echo "[rc] validating trace inspection output"
 cargo run -p rlua-cli --bin trace-inspect -- \

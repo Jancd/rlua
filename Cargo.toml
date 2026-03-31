@@ -24,3 +24,4 @@ rlua-vm = { path = "crates/rlua-vm" }
 rlua-ir = { path = "crates/rlua-ir" }
 rlua-jit = { path = "crates/rlua-jit" }
 rlua-stdlib = { path = "crates/rlua-stdlib" }
+proptest = "1.6.0"

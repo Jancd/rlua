@@ -2,6 +2,12 @@
 
 This document defines the repository-visible support surface, limitations, and validation path for the `v1.0.0-rc` candidate.
 
+Repository navigation:
+
+- [README.md](../README.md) for the top-level project overview
+- [docs/architecture.md](architecture.md) for crate boundaries and execution flow
+- [CONTRIBUTING.md](../CONTRIBUTING.md) for required and extended validation lanes
+
 ## Supported Runtime Surface
 
 - Interpreter: the validated Lua 5.1-compatible subset covered by the repository conformance and differential suites.
@@ -69,17 +75,30 @@ Interpret the benchmark output as follows:
 
 ## Release Validation Path
 
+For ordinary contributor validation, run:
+
+```bash
+sh scripts/validate-required.sh
+```
+
+For the extended hardening lane, run:
+
+```bash
+sh scripts/validate-hardening.sh
+```
+
 For a full release-candidate sweep, run:
 
 ```bash
 sh scripts/validate-rc.sh
 ```
 
-That sweep packages the required repository-native entrypoints:
-- `openspec validate m6-release-candidate --type change --strict`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
+That sweep packages the repository-native entrypoints:
+- `sh scripts/validate-required.sh`
+- `sh scripts/validate-hardening.sh`
 - `cargo run -p rlua-cli --bin trace-inspect -- --format json --hot-threshold 2 --side-exit-threshold 1 tests/jit/guard_invalidation_recovery.lua`
 - `cargo run --release -p rlua-cli --bin jit-bench -- --samples 3`
+
+If the release work is happening under an active OpenSpec change, validate that change separately before sync or archive.
 
 The RC is ready only when all of those checks pass and any slow-case output is either absent or understood and accepted within the documented limitations above.
