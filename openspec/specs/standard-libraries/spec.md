@@ -98,13 +98,21 @@ THEN the element at `pos` is removed, subsequent elements shift down, and the re
 WHEN `table.remove(t)` is called with one argument
 THEN the last element is removed and returned
 
-#### Scenario: table.sort
+#### Scenario: table.sort without comparator
 
 WHEN `table.sort(t)` is called without a comparator
-THEN `t` is sorted in ascending order using `<`
+THEN `t` is sorted in ascending order using Lua-visible `<` comparison semantics
 
-WHEN `table.sort(t, comp)` is called with a comparator function
-THEN `t` is sorted using `comp(a, b)` which returns true if `a` should come before `b`
+#### Scenario: table.sort with Lua or native comparator
+
+WHEN `table.sort(t, comp)` is called with a comparator function that may be native or Lua
+THEN `t` is sorted using repeated calls to `comp(a, b)`
+AND the comparator's truthiness result determines whether `a` should come before `b`
+
+#### Scenario: Comparator error propagates
+
+WHEN the comparator passed to `table.sort` raises an error
+THEN `table.sort` propagates that Lua-facing error instead of silently discarding it
 
 #### Scenario: table.concat
 

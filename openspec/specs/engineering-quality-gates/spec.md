@@ -56,6 +56,24 @@ THEN tests covering xpcall with handler, error object propagation, error with le
 WHEN `cargo test` is run
 THEN tests confirming tail call optimization (deep recursion without stack overflow) pass
 
+### Requirement: Coroutine and Library Gap Compatibility Coverage
+The project MUST add conformance, differential, and regression coverage for coroutine semantics and the remaining library/metamethod gap closures.
+
+#### Scenario: Conformance suite covers coroutine lifecycle
+- **WHEN** the conformance suite is executed
+- **THEN** it includes cases for `coroutine.create`, `coroutine.resume`, `coroutine.yield`, `coroutine.status`, `coroutine.running`, and `coroutine.wrap`
+- **AND** it verifies main-thread yield errors plus suspended/dead coroutine behavior
+
+#### Scenario: Differential suite covers closed semantic gaps
+- **WHEN** differential tests are run against reference Lua 5.1
+- **THEN** they include coroutine resume/yield behavior, `table.sort` with Lua comparator functions, and Lua-closure `__tostring` behavior
+- **AND** divergent observable results fail the suite
+
+#### Scenario: JIT-enabled execution remains semantically safe
+- **WHEN** the newly closed coroutine or library/metamethod paths are exercised with JIT enabled
+- **THEN** execution remains interpreter-equivalent for the supported subset
+- **AND** unsupported JIT interactions fall back safely without changing Lua-visible behavior
+
 ### Requirement: Minimal Dependency Policy Enforcement
 Core runtime crates MUST default to standard library only and justify any external dependency with documented rationale.
 

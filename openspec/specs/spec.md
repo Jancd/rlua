@@ -33,7 +33,7 @@ Out of scope for v1:
 - Trace IR + optimization passes.
 - Machine code backend for at least one architecture (x86_64 first).
 - Side exits and deoptimization back to interpreter.
-- Minimal standard library subset (`math`, `string`, `table`, `coroutine` subset optional).
+- Minimal standard library subset (`math`, `string`, `table`, baseline `coroutine` support).
 
 ### 2.2 Non-Functional Scope
 

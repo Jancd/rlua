@@ -111,10 +111,16 @@ Additional metamethods for string operations, length, and callable tables.
 
 Metamethods: `__tostring`, `__concat`, `__len`, `__call`.
 
-#### Scenario: __tostring
+#### Scenario: __tostring via native or Lua closure
 
-WHEN `tostring(t)` is called and `t` has a `__tostring` metamethod
-THEN the VM calls `__tostring(t)` and returns the string result
+WHEN `tostring(v)` is called and `v` has a `__tostring` metamethod that may be native or Lua
+THEN the runtime invokes that metamethod through ordinary Lua call semantics
+AND the metamethod result is used as the string conversion result
+
+#### Scenario: __tostring invalid result errors
+
+WHEN a `__tostring` metamethod returns a non-string-like result that is invalid for `tostring()`
+THEN the runtime raises a Lua-facing error instead of silently formatting the original value
 
 #### Scenario: __concat
 
