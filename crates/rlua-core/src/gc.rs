@@ -160,6 +160,9 @@ impl MarkSweepGc {
                 LuaValue::String(_) => {
                     reachable_count += 1;
                 }
+                LuaValue::Thread(_) => {
+                    reachable_count += 1;
+                }
                 _ => {}
             }
         }

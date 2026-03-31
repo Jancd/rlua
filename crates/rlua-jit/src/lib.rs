@@ -886,7 +886,9 @@ fn constant_value_from_lua(value: &LuaValue) -> Option<ConstantValue> {
         LuaValue::Nil => Some(ConstantValue::Nil),
         LuaValue::Boolean(value) => Some(ConstantValue::Boolean(*value)),
         LuaValue::Number(value) => Some(ConstantValue::Number(*value)),
-        LuaValue::String(_) | LuaValue::Table(_) | LuaValue::Function(_) => None,
+        LuaValue::String(_) | LuaValue::Table(_) | LuaValue::Function(_) | LuaValue::Thread(_) => {
+            None
+        }
     }
 }
 

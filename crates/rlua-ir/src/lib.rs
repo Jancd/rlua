@@ -12,6 +12,7 @@ pub enum ValueType {
     Nil,
     Table,
     Function,
+    Thread,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

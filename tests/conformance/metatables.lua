@@ -17,8 +17,34 @@ assert(getmetatable(t2) == "protected", "__metatable returned by getmetatable")
 local ok, err = pcall(setmetatable, t2, {})
 assert(ok == false, "__metatable blocks setmetatable")
 
--- __tostring metamethod (only works with native functions in current implementation)
--- Lua closure __tostring not supported yet since tostring() is native and can't call Lua functions
+-- __tostring metamethod
+local pretty = setmetatable({x = 3, y = 4}, {
+    __tostring = function(self)
+        return "Point(" .. self.x .. ", " .. self.y .. ")"
+    end
+})
+assert(tostring(pretty) == "Point(3, 4)", "__tostring via Lua closure")
+
+local invalid = setmetatable({}, {
+    __tostring = function()
+        return {}
+    end
+})
+local invalid_ok, invalid_err = pcall(tostring, invalid)
+assert(invalid_ok == false, "__tostring invalid result errors")
+assert(string.find(invalid_err, "must return a string"), "__tostring invalid result message")
+
+local yielding = setmetatable({}, {
+    __tostring = function()
+        coroutine.yield("blocked")
+        return "never"
+    end
+})
+local yield_ok, yield_err = coroutine.resume(coroutine.create(function()
+    return tostring(yielding)
+end))
+assert(yield_ok == false, "__tostring yield across native boundary errors")
+assert(string.find(yield_err, "native callback boundary"), "__tostring yield boundary message")
 
 -- __index as table
 local base = {x = 10, y = 20}

@@ -243,3 +243,16 @@ fn jit_invalidated_trace_can_recompile_without_drift() {
     assert!(replacement.side_exit_count <= u64::from(config.side_exit_threshold));
     assert!(replacement.replay_entries + replacement.native_entries >= 1);
 }
+
+#[test]
+fn jit_coroutine_execution_stays_interpreter_only() {
+    let (jit_results, jit_output, jit_debug) = run_jit_case("coroutine_interpreter_only.lua", true);
+    let (interp_results, interp_output, interp_debug) =
+        run_jit_case("coroutine_interpreter_only.lua", false);
+
+    assert_eq!(jit_results, interp_results);
+    assert_eq!(jit_output, interp_output);
+    assert_eq!(jit_debug.trace_count, 0);
+    assert_eq!(jit_debug.stats.native_entries, 0);
+    assert_eq!(interp_debug.trace_count, 0);
+}

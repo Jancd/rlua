@@ -1,13 +1,16 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::mem;
 use std::rc::Rc;
 
 use rlua_core::bytecode::RK_OFFSET;
-use rlua_core::function::{Closure, FunctionProto, LuaFunction, NativeFn, UpvalRef};
+use rlua_core::function::{
+    CallOutcome, Closure, FunctionProto, LuaFunction, NativeFn, NativeVmContext, UpvalRef,
+};
 use rlua_core::gc::{GcRoot, GcRootProvider, MarkSweepGc, RootSource};
 use rlua_core::opcode::Opcode;
 use rlua_core::table::{LuaTable, TableRef};
-use rlua_core::value::LuaValue;
+use rlua_core::value::{LuaThread, LuaValue, ThreadRef};
 #[cfg(test)]
 use rlua_ir::Trace;
 use rlua_ir::{IrOp, TraceDeoptExit, TraceDeoptExitKind, ValueType};
@@ -51,6 +54,47 @@ struct CallFrame {
     varargs: Vec<LuaValue>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingResume {
+    target: ResumeTarget,
+}
+
+#[derive(Debug, Clone)]
+enum ResumeTarget {
+    Call {
+        base: usize,
+        register: u8,
+        num_results_wanted: i32,
+    },
+    TailReturn,
+    EntryReturn,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionContext {
+    stack: Vec<LuaValue>,
+    frames: Vec<CallFrame>,
+    open_upvalues: HashMap<usize, UpvalRef>,
+    pending_side_exit: Option<TraceKey>,
+    pending_resume: Option<PendingResume>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoroutineStatus {
+    Suspended,
+    Running,
+    Normal,
+    Dead,
+}
+
+#[derive(Debug, Clone)]
+struct CoroutineState {
+    thread: ThreadRef,
+    context: ExecutionContext,
+    entry: Option<LuaValue>,
+    status: CoroutineStatus,
+}
+
 // ---------------------------------------------------------------------------
 // VM State
 // ---------------------------------------------------------------------------
@@ -71,6 +115,12 @@ pub struct VmState {
     loop_hotness: HashMap<TraceKey, u32>,
     /// Prevent immediate re-entry into a trace right after a side exit.
     pending_side_exit: Option<TraceKey>,
+    /// Result placement for a suspended coroutine.yield call.
+    pending_resume: Option<PendingResume>,
+    /// Suspended or non-running coroutine contexts keyed by thread identity.
+    coroutines: HashMap<usize, CoroutineState>,
+    /// The currently executing coroutine. `None` means the main thread.
+    current_thread: Option<ThreadRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +158,9 @@ impl VmState {
             jit: JitRuntime::new(config),
             loop_hotness: HashMap::new(),
             pending_side_exit: None,
+            pending_resume: None,
+            coroutines: HashMap::new(),
+            current_thread: None,
         }
     }
 
@@ -250,6 +303,282 @@ impl VmState {
         }
     }
 
+    fn take_execution_context(&mut self) -> ExecutionContext {
+        ExecutionContext {
+            stack: mem::take(&mut self.stack),
+            frames: mem::take(&mut self.frames),
+            open_upvalues: mem::take(&mut self.open_upvalues),
+            pending_side_exit: self.pending_side_exit.take(),
+            pending_resume: self.pending_resume.take(),
+        }
+    }
+
+    fn restore_execution_context(&mut self, context: ExecutionContext) {
+        self.stack = context.stack;
+        self.frames = context.frames;
+        self.open_upvalues = context.open_upvalues;
+        self.pending_side_exit = context.pending_side_exit;
+        self.pending_resume = context.pending_resume;
+    }
+
+    fn thread_key(thread: &ThreadRef) -> usize {
+        Rc::as_ptr(thread) as usize
+    }
+
+    fn create_coroutine_state(&mut self, func: LuaValue) -> Result<LuaValue, LuaError> {
+        if !matches!(func, LuaValue::Function(_)) {
+            return Err(LuaError::Type(format!(
+                "bad argument #1 to 'create' (function expected, got {})",
+                func.type_name()
+            )));
+        }
+
+        let thread = Rc::new(LuaThread);
+        let key = Self::thread_key(&thread);
+        self.coroutines.insert(
+            key,
+            CoroutineState {
+                thread: thread.clone(),
+                context: ExecutionContext {
+                    stack: Vec::with_capacity(256),
+                    frames: Vec::new(),
+                    open_upvalues: HashMap::new(),
+                    pending_side_exit: None,
+                    pending_resume: None,
+                },
+                entry: Some(func),
+                status: CoroutineStatus::Suspended,
+            },
+        );
+        Ok(LuaValue::Thread(thread))
+    }
+
+    fn coroutine_status_of(&self, thread: &ThreadRef) -> &'static str {
+        let key = Self::thread_key(thread);
+        if let Some(current) = &self.current_thread
+            && Rc::ptr_eq(current, thread)
+        {
+            return "running";
+        }
+
+        self.coroutines
+            .get(&key)
+            .map(|state| match state.status {
+                CoroutineStatus::Suspended => "suspended",
+                CoroutineStatus::Running => "running",
+                CoroutineStatus::Normal => "normal",
+                CoroutineStatus::Dead => "dead",
+            })
+            .unwrap_or("dead")
+    }
+
+    fn cleanup_current_frame(&mut self) {
+        let base = self
+            .frames
+            .last()
+            .expect("frame cleanup requires an active call frame")
+            .base;
+        self.close_upvalues(base);
+        self.stack.truncate(base);
+        self.frames.pop();
+    }
+
+    fn cleanup_frames_to_depth(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            self.cleanup_current_frame();
+        }
+        self.pending_resume = None;
+    }
+
+    fn apply_pending_resume(
+        &mut self,
+        values: &[LuaValue],
+    ) -> Result<Option<Vec<LuaValue>>, LuaError> {
+        let Some(pending) = self.pending_resume.take() else {
+            return Ok(None);
+        };
+
+        match pending.target {
+            ResumeTarget::Call {
+                base,
+                register,
+                num_results_wanted,
+            } => {
+                write_call_results(self, base, register, num_results_wanted, values);
+                Ok(None)
+            }
+            ResumeTarget::TailReturn | ResumeTarget::EntryReturn => Ok(Some(values.to_vec())),
+        }
+    }
+
+    fn continue_after_saved_return(
+        &mut self,
+        results: Vec<LuaValue>,
+    ) -> Result<Option<CallOutcome>, LuaError> {
+        loop {
+            if !self.frames.is_empty() {
+                self.cleanup_current_frame();
+            }
+
+            let Some(frame) = self.frames.last() else {
+                return Ok(Some(CallOutcome::Return(results)));
+            };
+
+            let call_pc = frame
+                .pc
+                .checked_sub(1)
+                .ok_or_else(|| LuaError::Runtime("coroutine resume lost caller pc".to_owned()))?;
+            let instr = frame.closure.proto.code[call_pc];
+
+            match instr.opcode() {
+                Opcode::Call => {
+                    let num_results_wanted = if instr.c() == 0 {
+                        -1
+                    } else {
+                        (instr.c() - 1) as i32
+                    };
+                    write_call_results(self, frame.base, instr.a(), num_results_wanted, &results);
+                    return Ok(None);
+                }
+                Opcode::TailCall => continue,
+                opcode => {
+                    return Err(LuaError::Runtime(format!(
+                        "coroutine resume reached unsupported caller opcode {opcode:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn run_resumed_execution(&mut self, args: &[LuaValue]) -> Result<CallOutcome, LuaError> {
+        if let Some(results) = self.apply_pending_resume(args)?
+            && let Some(outcome) = self.continue_after_saved_return(results)?
+        {
+            return Ok(outcome);
+        }
+
+        loop {
+            match run_loop_outcome(self)? {
+                CallOutcome::Yield(values) => return Ok(CallOutcome::Yield(values)),
+                CallOutcome::Return(values) => {
+                    if let Some(outcome) = self.continue_after_saved_return(values)? {
+                        return Ok(outcome);
+                    }
+                }
+            }
+        }
+    }
+
+    fn resume_coroutine_state(
+        &mut self,
+        thread: &ThreadRef,
+        args: &[LuaValue],
+    ) -> Result<Vec<LuaValue>, LuaError> {
+        let key = Self::thread_key(thread);
+        let Some(mut coroutine) = self.coroutines.remove(&key) else {
+            return Ok(vec![
+                LuaValue::Boolean(false),
+                LuaValue::from("cannot resume dead coroutine"),
+            ]);
+        };
+
+        match coroutine.status {
+            CoroutineStatus::Dead => {
+                self.coroutines.insert(key, coroutine);
+                return Ok(vec![
+                    LuaValue::Boolean(false),
+                    LuaValue::from("cannot resume dead coroutine"),
+                ]);
+            }
+            CoroutineStatus::Running | CoroutineStatus::Normal => {
+                self.coroutines.insert(key, coroutine);
+                return Ok(vec![
+                    LuaValue::Boolean(false),
+                    LuaValue::from("cannot resume non-suspended coroutine"),
+                ]);
+            }
+            CoroutineStatus::Suspended => {}
+        }
+
+        let parent_thread = self.current_thread.clone();
+        let parent_context = self.take_execution_context();
+        if let Some(parent) = &parent_thread {
+            let parent_key = Self::thread_key(parent);
+            self.coroutines.insert(
+                parent_key,
+                CoroutineState {
+                    thread: parent.clone(),
+                    context: parent_context.clone(),
+                    entry: None,
+                    status: CoroutineStatus::Normal,
+                },
+            );
+        }
+
+        self.restore_execution_context(coroutine.context.clone());
+        self.current_thread = Some(thread.clone());
+        coroutine.status = CoroutineStatus::Running;
+
+        let outcome = if let Some(entry) = coroutine.entry.take() {
+            let outcome = call_function_outcome(self, &entry, args);
+            if matches!(outcome, Ok(CallOutcome::Yield(_)))
+                && self.frames.is_empty()
+                && self.pending_resume.is_none()
+            {
+                self.pending_resume = Some(PendingResume {
+                    target: ResumeTarget::EntryReturn,
+                });
+            }
+            outcome
+        } else {
+            self.run_resumed_execution(args)
+        };
+
+        let active_context = self.take_execution_context();
+        let mut resume_results = Vec::new();
+
+        match outcome {
+            Ok(CallOutcome::Return(values)) => {
+                coroutine.context = active_context;
+                coroutine.status = CoroutineStatus::Dead;
+                resume_results.push(LuaValue::Boolean(true));
+                resume_results.extend(values);
+            }
+            Ok(CallOutcome::Yield(values)) => {
+                coroutine.context = active_context;
+                coroutine.status = CoroutineStatus::Suspended;
+                resume_results.push(LuaValue::Boolean(true));
+                resume_results.extend(values);
+            }
+            Err(err) => {
+                coroutine.context = active_context;
+                coroutine.status = CoroutineStatus::Dead;
+                resume_results.push(LuaValue::Boolean(false));
+                resume_results.push(lua_error_to_value(err));
+            }
+        }
+
+        if coroutine.status != CoroutineStatus::Dead {
+            self.coroutines.insert(key, coroutine);
+        }
+
+        if let Some(parent) = parent_thread {
+            let parent_key = Self::thread_key(&parent);
+            let mut parent_state = self
+                .coroutines
+                .remove(&parent_key)
+                .expect("parent coroutine context missing");
+            parent_state.status = CoroutineStatus::Running;
+            self.restore_execution_context(parent_state.context);
+            self.current_thread = Some(parent);
+        } else {
+            self.restore_execution_context(parent_context);
+            self.current_thread = None;
+        }
+
+        Ok(resume_results)
+    }
+
     /// Notify GC of an allocation and run collection if threshold exceeded.
     fn notify_alloc(&mut self) {
         if self.gc.notify_alloc() {
@@ -279,6 +608,10 @@ impl VmState {
     }
 
     fn track_loop_hotness(&mut self, loop_header_pc: usize) {
+        if self.current_thread.is_some() {
+            return;
+        }
+
         if !self.jit.is_active() {
             return;
         }
@@ -336,6 +669,63 @@ impl Default for VmState {
     }
 }
 
+impl NativeVmContext for VmState {
+    fn call_function(
+        &mut self,
+        func: &LuaValue,
+        args: &[LuaValue],
+    ) -> Result<Vec<LuaValue>, String> {
+        call_function(self, func, args).map_err(|err| err.to_string())
+    }
+
+    fn source_location(&self) -> String {
+        VmState::source_location(self)
+    }
+
+    fn create_coroutine(&mut self, func: &LuaValue) -> Result<LuaValue, String> {
+        self.create_coroutine_state(func.clone())
+            .map_err(|err| err.to_string())
+    }
+
+    fn resume_coroutine(
+        &mut self,
+        thread: &LuaValue,
+        args: &[LuaValue],
+    ) -> Result<Vec<LuaValue>, String> {
+        let LuaValue::Thread(thread) = thread else {
+            return Err(format!(
+                "bad argument #1 to 'resume' (thread expected, got {})",
+                thread.type_name()
+            ));
+        };
+        self.resume_coroutine_state(thread, args)
+            .map_err(|err| err.to_string())
+    }
+
+    fn running_coroutine(&self) -> Option<LuaValue> {
+        self.current_thread
+            .as_ref()
+            .map(|thread| LuaValue::Thread(thread.clone()))
+    }
+
+    fn coroutine_status(&self, thread: &LuaValue) -> Result<&'static str, String> {
+        let LuaValue::Thread(thread) = thread else {
+            return Err(format!(
+                "bad argument #1 to 'status' (thread expected, got {})",
+                thread.type_name()
+            ));
+        };
+        Ok(self.coroutine_status_of(thread))
+    }
+
+    fn yield_current(&mut self, args: &[LuaValue]) -> Result<CallOutcome, String> {
+        if self.current_thread.is_none() {
+            return Err("attempt to yield from outside a coroutine".to_owned());
+        }
+        Ok(CallOutcome::Yield(args.to_vec()))
+    }
+}
+
 impl GcRootProvider for VmState {
     fn gc_roots(&self, roots: &mut Vec<GcRoot>) {
         for val in &self.stack {
@@ -355,6 +745,32 @@ impl GcRootProvider for VmState {
                 source: RootSource::OpenUpvalues,
                 value: uv.borrow().clone(),
             });
+        }
+        for coroutine in self.coroutines.values() {
+            roots.push(GcRoot {
+                source: RootSource::OpenUpvalues,
+                value: LuaValue::Thread(coroutine.thread.clone()),
+            });
+            if let Some(entry) = &coroutine.entry {
+                roots.push(GcRoot {
+                    source: RootSource::OpenUpvalues,
+                    value: entry.clone(),
+                });
+            }
+            for value in &coroutine.context.stack {
+                if !matches!(value, LuaValue::Nil) {
+                    roots.push(GcRoot {
+                        source: RootSource::OpenUpvalues,
+                        value: value.clone(),
+                    });
+                }
+            }
+            for uv in coroutine.context.open_upvalues.values() {
+                roots.push(GcRoot {
+                    source: RootSource::OpenUpvalues,
+                    value: uv.borrow().clone(),
+                });
+            }
         }
     }
 }
@@ -385,6 +801,7 @@ fn value_type_of(value: &LuaValue) -> ValueType {
         LuaValue::String(_) => ValueType::String,
         LuaValue::Table(_) => ValueType::Table,
         LuaValue::Function(_) => ValueType::Function,
+        LuaValue::Thread(_) => ValueType::Thread,
     }
 }
 
@@ -544,6 +961,22 @@ pub fn execute_closure(
     closure: Rc<Closure>,
     args: &[LuaValue],
 ) -> Result<Vec<LuaValue>, LuaError> {
+    match execute_closure_outcome(state, closure, args)? {
+        CallOutcome::Return(values) => Ok(values),
+        CallOutcome::Yield(_) => {
+            state.pending_resume = None;
+            Err(LuaError::Runtime(
+                "attempt to yield from outside a coroutine".to_owned(),
+            ))
+        }
+    }
+}
+
+fn execute_closure_outcome(
+    state: &mut VmState,
+    closure: Rc<Closure>,
+    args: &[LuaValue],
+) -> Result<CallOutcome, LuaError> {
     let base = state.stack.len();
     let proto = &closure.proto;
 
@@ -571,11 +1004,14 @@ pub fn execute_closure(
         varargs,
     });
 
-    let result = run_loop(state);
-
-    state.close_upvalues(base);
-    state.stack.truncate(base);
-    state.frames.pop();
+    let result = run_loop_outcome(state);
+    let should_cleanup =
+        !matches!(result, Ok(CallOutcome::Yield(_))) || state.current_thread.is_none();
+    if should_cleanup {
+        state.close_upvalues(base);
+        state.stack.truncate(base);
+        state.frames.pop();
+    }
 
     result
 }
@@ -586,6 +1022,10 @@ fn maybe_run_cached_trace(
     pc: usize,
     proto: &Rc<FunctionProto>,
 ) -> Result<bool, LuaError> {
+    if state.current_thread.is_some() {
+        return Ok(false);
+    }
+
     if !state.jit.is_active() {
         return Ok(false);
     }
@@ -927,7 +1367,7 @@ fn execute_replay_instruction(
     }
 }
 
-fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
+fn run_loop_outcome(state: &mut VmState) -> Result<CallOutcome, LuaError> {
     loop {
         let frame = state.frames.last().unwrap();
         let base = frame.base;
@@ -935,7 +1375,7 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
         let proto = frame.closure.proto.clone();
 
         if pc >= proto.code.len() {
-            return Ok(Vec::new());
+            return Ok(CallOutcome::Return(Vec::new()));
         }
 
         if maybe_run_cached_trace(state, base, pc, &proto)? {
@@ -1378,21 +1818,24 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
 
                     return Err(LuaError::Runtime(annotated_msg.to_lua_string()));
                 } else {
-                    call_function(state, &func_val, &args)?
+                    match call_function_outcome(state, &func_val, &args)? {
+                        CallOutcome::Return(results) => results,
+                        CallOutcome::Yield(values) => {
+                            if state.pending_resume.is_none() {
+                                state.pending_resume = Some(PendingResume {
+                                    target: ResumeTarget::Call {
+                                        base,
+                                        register: a,
+                                        num_results_wanted,
+                                    },
+                                });
+                            }
+                            return Ok(CallOutcome::Yield(values));
+                        }
+                    }
                 };
 
-                let num_results = results.len();
-                if num_results_wanted < 0 {
-                    for (i, val) in results.into_iter().enumerate() {
-                        state.set_reg(base, a + i as u8, val);
-                    }
-                    state.stack.truncate(base + a as usize + num_results);
-                } else {
-                    for i in 0..num_results_wanted as usize {
-                        let val = results.get(i).cloned().unwrap_or(LuaValue::Nil);
-                        state.set_reg(base, a + i as u8, val);
-                    }
-                }
+                write_call_results(state, base, a, num_results_wanted, &results);
             }
 
             Opcode::TailCall => {
@@ -1414,131 +1857,112 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     .map(|i| state.get_reg(base, a + 1 + i as u8).clone())
                     .collect();
 
-                // Tail call optimization: if calling a Lua closure, reuse current frame
-                match &func_val {
-                    LuaValue::Function(f) => match f.as_ref() {
-                        LuaFunction::Lua(closure) => {
-                            let new_proto = &closure.proto;
-                            state.close_upvalues(base);
+                // Tail call optimization: if calling a Lua closure, reuse current frame.
+                if let LuaValue::Function(f) = &func_val
+                    && let LuaFunction::Lua(closure) = f.as_ref()
+                {
+                    let new_proto = &closure.proto;
+                    state.close_upvalues(base);
 
-                            // Set up params in current frame's registers
-                            for i in 0..new_proto.num_params as usize {
-                                let val = args.get(i).cloned().unwrap_or(LuaValue::Nil);
-                                state.set_reg(base, i as u8, val);
-                            }
-
-                            let varargs = if new_proto.is_vararg {
-                                args.get(new_proto.num_params as usize..)
-                                    .unwrap_or(&[])
-                                    .to_vec()
-                            } else {
-                                Vec::new()
-                            };
-
-                            // Reuse the current call frame
-                            let frame = state.frames.last_mut().unwrap();
-                            frame.closure = closure.clone();
-                            frame.pc = 0;
-                            frame.varargs = varargs;
-                            // base stays the same — that's the optimization
-                            continue;
-                        }
-                        LuaFunction::Native { name, func } => {
-                            // Check for pcall/xpcall interception
-                            if *name == "pcall" {
-                                if args.is_empty() {
-                                    return Err(LuaError::Runtime(
-                                        "bad argument #1 to 'pcall' (value expected)".to_owned(),
-                                    ));
-                                }
-                                let pcall_func = args[0].clone();
-                                let pcall_args = if args.len() > 1 { &args[1..] } else { &[] };
-                                let results = match call_function(state, &pcall_func, pcall_args) {
-                                    Ok(mut res) => {
-                                        res.insert(0, LuaValue::Boolean(true));
-                                        res
-                                    }
-                                    Err(e) => {
-                                        let msg = lua_error_to_value(e);
-                                        vec![LuaValue::Boolean(false), msg]
-                                    }
-                                };
-                                return Ok(results);
-                            } else if *name == "xpcall" {
-                                if args.len() < 2 {
-                                    return Err(LuaError::Runtime(
-                                        "bad argument #1 to 'xpcall' (value expected)".to_owned(),
-                                    ));
-                                }
-                                let xpcall_func = args[0].clone();
-                                let handler = args[1].clone();
-                                let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
-                                let results = match call_function(state, &xpcall_func, xpcall_args)
-                                {
-                                    Ok(mut res) => {
-                                        res.insert(0, LuaValue::Boolean(true));
-                                        res
-                                    }
-                                    Err(e) => {
-                                        let err_val = lua_error_to_value(e);
-                                        match call_function(
-                                            state,
-                                            &handler,
-                                            std::slice::from_ref(&err_val),
-                                        ) {
-                                            Ok(mut res) => {
-                                                res.insert(0, LuaValue::Boolean(false));
-                                                res
-                                            }
-                                            Err(handler_err) => {
-                                                let msg = lua_error_to_value(handler_err);
-                                                vec![LuaValue::Boolean(false), msg]
-                                            }
-                                        }
-                                    }
-                                };
-                                return Ok(results);
-                            } else if *name == "error" {
-                                // Intercept error() to prepend source location
-                                let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
-                                let level =
-                                    args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i32;
-                                let annotated_msg = if level > 0 {
-                                    if let LuaValue::String(ref s) = msg {
-                                        let loc = state.source_location();
-                                        LuaValue::String(std::rc::Rc::new(format!("{loc}: {s}")))
-                                    } else {
-                                        msg
-                                    }
-                                } else {
-                                    msg
-                                };
-                                return Err(LuaError::Runtime(annotated_msg.to_lua_string()));
-                            }
-                            let results = func(&args).map_err(LuaError::Runtime)?;
-                            return Ok(results);
-                        }
-                    },
-                    LuaValue::Table(t) => {
-                        // Check __call metamethod
-                        if let Some(mm) = t.borrow().get_metamethod("__call") {
-                            let mut call_args = vec![func_val.clone()];
-                            call_args.extend(args);
-                            let results = call_function(state, &mm, &call_args)?;
-                            return Ok(results);
-                        }
-                        return Err(LuaError::Type(format!(
-                            "attempt to call a {} value",
-                            func_val.type_name()
-                        )));
+                    for i in 0..new_proto.num_params as usize {
+                        let val = args.get(i).cloned().unwrap_or(LuaValue::Nil);
+                        state.set_reg(base, i as u8, val);
                     }
-                    _ => {
-                        return Err(LuaError::Type(format!(
-                            "attempt to call a {} value",
-                            func_val.type_name()
-                        )));
-                    }
+
+                    let varargs = if new_proto.is_vararg {
+                        args.get(new_proto.num_params as usize..)
+                            .unwrap_or(&[])
+                            .to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let frame = state.frames.last_mut().unwrap();
+                    frame.closure = closure.clone();
+                    frame.pc = 0;
+                    frame.varargs = varargs;
+                    continue;
                 }
+
+                let is_pcall = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "pcall", .. }));
+                let is_xpcall = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "xpcall", .. }));
+                let is_error = matches!(&func_val, LuaValue::Function(f) if matches!(f.as_ref(), LuaFunction::Native { name: "error", .. }));
+
+                let results = if is_pcall {
+                    if args.is_empty() {
+                        return Err(LuaError::Runtime(
+                            "bad argument #1 to 'pcall' (value expected)".to_owned(),
+                        ));
+                    }
+                    let pcall_func = args[0].clone();
+                    let pcall_args = if args.len() > 1 { &args[1..] } else { &[] };
+                    match call_function(state, &pcall_func, pcall_args) {
+                        Ok(mut res) => {
+                            res.insert(0, LuaValue::Boolean(true));
+                            res
+                        }
+                        Err(e) => {
+                            let msg = lua_error_to_value(e);
+                            vec![LuaValue::Boolean(false), msg]
+                        }
+                    }
+                } else if is_xpcall {
+                    if args.len() < 2 {
+                        return Err(LuaError::Runtime(
+                            "bad argument #1 to 'xpcall' (value expected)".to_owned(),
+                        ));
+                    }
+                    let xpcall_func = args[0].clone();
+                    let handler = args[1].clone();
+                    let xpcall_args = if args.len() > 2 { &args[2..] } else { &[] };
+                    match call_function(state, &xpcall_func, xpcall_args) {
+                        Ok(mut res) => {
+                            res.insert(0, LuaValue::Boolean(true));
+                            res
+                        }
+                        Err(e) => {
+                            let err_val = lua_error_to_value(e);
+                            match call_function(state, &handler, std::slice::from_ref(&err_val)) {
+                                Ok(mut res) => {
+                                    res.insert(0, LuaValue::Boolean(false));
+                                    res
+                                }
+                                Err(handler_err) => {
+                                    let msg = lua_error_to_value(handler_err);
+                                    vec![LuaValue::Boolean(false), msg]
+                                }
+                            }
+                        }
+                    }
+                } else if is_error {
+                    let msg = args.first().cloned().unwrap_or(LuaValue::Nil);
+                    let level = args.get(1).and_then(|v| v.to_number()).unwrap_or(1.0) as i32;
+                    let annotated_msg = if level > 0 {
+                        if let LuaValue::String(ref s) = msg {
+                            let loc = state.source_location();
+                            LuaValue::String(std::rc::Rc::new(format!("{loc}: {s}")))
+                        } else {
+                            msg
+                        }
+                    } else {
+                        msg
+                    };
+                    return Err(LuaError::Runtime(annotated_msg.to_lua_string()));
+                } else {
+                    match call_function_outcome(state, &func_val, &args)? {
+                        CallOutcome::Return(results) => results,
+                        CallOutcome::Yield(values) => {
+                            if state.pending_resume.is_none() {
+                                state.pending_resume = Some(PendingResume {
+                                    target: ResumeTarget::TailReturn,
+                                });
+                            }
+                            return Ok(CallOutcome::Yield(values));
+                        }
+                    }
+                };
+
+                return Ok(CallOutcome::Return(results));
             }
 
             Opcode::Return => {
@@ -1551,15 +1975,15 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
                     } else {
                         Vec::new()
                     };
-                    return Ok(results);
+                    return Ok(CallOutcome::Return(results));
                 } else if b == 1 {
-                    return Ok(Vec::new());
+                    return Ok(CallOutcome::Return(Vec::new()));
                 } else {
                     let count = (b - 1) as usize;
                     let results: Vec<LuaValue> = (0..count)
                         .map(|i| state.get_reg(base, a + i as u8).clone())
                         .collect();
-                    return Ok(results);
+                    return Ok(CallOutcome::Return(results));
                 }
             }
 
@@ -1692,28 +2116,41 @@ fn run_loop(state: &mut VmState) -> Result<Vec<LuaValue>, LuaError> {
             Opcode::Nop => {}
 
             Opcode::Halt => {
-                return Ok(Vec::new());
+                return Ok(CallOutcome::Return(Vec::new()));
             }
         }
     }
 }
 
-fn call_function(
+fn call_function_outcome(
     state: &mut VmState,
     func_val: &LuaValue,
     args: &[LuaValue],
-) -> Result<Vec<LuaValue>, LuaError> {
+) -> Result<CallOutcome, LuaError> {
     match func_val {
         LuaValue::Function(f) => match f.as_ref() {
-            LuaFunction::Native { func, .. } => func(args).map_err(LuaError::Runtime),
-            LuaFunction::Lua(closure) => execute_closure(state, closure.clone(), args),
+            LuaFunction::Native { func, .. } => func(state, args).map_err(LuaError::Runtime),
+            LuaFunction::Lua(closure) => execute_closure_outcome(state, closure.clone(), args),
+            LuaFunction::WrappedCoroutine { thread } => {
+                let mut results = state.resume_coroutine_state(thread, args)?;
+                if matches!(results.first(), Some(LuaValue::Boolean(true))) {
+                    results.remove(0);
+                    Ok(CallOutcome::Return(results))
+                } else {
+                    let err = results
+                        .get(1)
+                        .cloned()
+                        .unwrap_or_else(|| LuaValue::from("coroutine.wrap failed"));
+                    Err(LuaError::Runtime(err.to_lua_string()))
+                }
+            }
         },
         LuaValue::Table(t) => {
             // __call metamethod
             if let Some(mm) = t.borrow().get_metamethod("__call") {
                 let mut call_args = vec![func_val.clone()];
                 call_args.extend_from_slice(args);
-                call_function(state, &mm, &call_args)
+                call_function_outcome(state, &mm, &call_args)
             } else {
                 Err(LuaError::Type(format!(
                     "attempt to call a {} value",
@@ -1728,9 +2165,47 @@ fn call_function(
     }
 }
 
+fn call_function(
+    state: &mut VmState,
+    func_val: &LuaValue,
+    args: &[LuaValue],
+) -> Result<Vec<LuaValue>, LuaError> {
+    let frame_depth = state.frames.len();
+    match call_function_outcome(state, func_val, args)? {
+        CallOutcome::Return(values) => Ok(values),
+        CallOutcome::Yield(_) => {
+            state.cleanup_frames_to_depth(frame_depth);
+            Err(LuaError::Runtime(
+                "attempt to yield across a native callback boundary".to_owned(),
+            ))
+        }
+    }
+}
+
 fn lua_error_to_value(e: LuaError) -> LuaValue {
     match e {
         LuaError::Runtime(s) | LuaError::Type(s) | LuaError::Arithmetic(s) => LuaValue::from(s),
+    }
+}
+
+fn write_call_results(
+    state: &mut VmState,
+    base: usize,
+    register: u8,
+    num_results_wanted: i32,
+    results: &[LuaValue],
+) {
+    let num_results = results.len();
+    if num_results_wanted < 0 {
+        for (i, val) in results.iter().cloned().enumerate() {
+            state.set_reg(base, register + i as u8, val);
+        }
+        state.stack.truncate(base + register as usize + num_results);
+    } else {
+        for i in 0..num_results_wanted as usize {
+            let val = results.get(i).cloned().unwrap_or(LuaValue::Nil);
+            state.set_reg(base, register + i as u8, val);
+        }
     }
 }
 
@@ -2152,10 +2627,13 @@ mod tests {
 
     #[test]
     fn execute_native_call() {
-        fn my_add(args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+        fn my_add(
+            _ctx: &mut dyn NativeVmContext,
+            args: &[LuaValue],
+        ) -> Result<CallOutcome, String> {
             let a = args.first().and_then(|v| v.to_number()).unwrap_or(0.0);
             let b = args.get(1).and_then(|v| v.to_number()).unwrap_or(0.0);
-            Ok(vec![LuaValue::Number(a + b)])
+            Ok(CallOutcome::Return(vec![LuaValue::Number(a + b)]))
         }
 
         let proto = make_proto(

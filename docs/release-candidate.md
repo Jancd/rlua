@@ -5,7 +5,7 @@ This document defines the repository-visible support surface, limitations, and v
 ## Supported Runtime Surface
 
 - Interpreter: the validated Lua 5.1-compatible subset covered by the repository conformance and differential suites.
-- Standard library: the stdlib surface exercised by the current conformance and differential tests.
+- Standard library: the stdlib surface exercised by the current conformance and differential tests, including the baseline `coroutine` library.
 - Tracing JIT: the M5-supported hot-loop subset centered on numeric `for` loops and stable numeric arithmetic traces.
 - Native backend: x86_64 only. Other architectures remain semantically correct through replay or interpreter fallback.
 - Fallback behavior: guard failures, side exits, downgrade, and invalidation remain supported only insofar as they preserve interpreter-equivalent behavior for the validated subset.
@@ -43,9 +43,10 @@ The inspection output is the release-facing source of truth for:
 ## Known Limitations
 
 - The tracing JIT is not a general Lua 5.1 compiler. It only targets the numeric loop subset already validated by the repository JIT tests and benchmark harness.
+- Coroutine execution remains interpreter-only. JIT recording and native trace entry are intentionally disabled for coroutine-owned execution contexts.
+- Yielding across native callback boundaries remains unsupported. This includes yielding through library-driven Lua callbacks such as `table.sort` comparators or `tostring()` `__tostring` metamethod dispatch.
 - Native code generation is not available outside x86_64. Unsupported architectures use replay or interpreter fallback instead.
 - Trace inspection is a post-run summary surface, not a streaming trace debugger.
-- The RC does not add new Lua language coverage beyond the subset already delivered by M5.
 - Unsupported or unoptimized trace shapes may still record or replay, but they are not part of the release-candidate performance promise.
 
 ## Benchmark Expectations

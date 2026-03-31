@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::Instruction;
-use crate::value::LuaValue;
+use crate::value::{LuaValue, ThreadRef};
 
 /// Description of a local variable (debug info).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +71,30 @@ impl Default for FunctionProto {
 /// A shared reference to a captured upvalue.
 pub type UpvalRef = Rc<RefCell<LuaValue>>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallOutcome {
+    Return(Vec<LuaValue>),
+    Yield(Vec<LuaValue>),
+}
+
+pub trait NativeVmContext {
+    fn call_function(
+        &mut self,
+        func: &LuaValue,
+        args: &[LuaValue],
+    ) -> Result<Vec<LuaValue>, String>;
+    fn source_location(&self) -> String;
+    fn create_coroutine(&mut self, func: &LuaValue) -> Result<LuaValue, String>;
+    fn resume_coroutine(
+        &mut self,
+        thread: &LuaValue,
+        args: &[LuaValue],
+    ) -> Result<Vec<LuaValue>, String>;
+    fn running_coroutine(&self) -> Option<LuaValue>;
+    fn coroutine_status(&self, thread: &LuaValue) -> Result<&'static str, String>;
+    fn yield_current(&mut self, args: &[LuaValue]) -> Result<CallOutcome, String>;
+}
+
 /// A runtime closure: a function prototype plus captured upvalues.
 #[derive(Debug, Clone)]
 pub struct Closure {
@@ -87,14 +111,16 @@ impl Closure {
     }
 }
 
-/// Native function signature: takes arguments, returns results or error.
-pub type NativeFn = fn(args: &[LuaValue]) -> Result<Vec<LuaValue>, String>;
+/// Native function signature: takes a VM-aware context, returns results or error.
+pub type NativeFn =
+    fn(ctx: &mut dyn NativeVmContext, args: &[LuaValue]) -> Result<CallOutcome, String>;
 
 /// A Lua function can be either a Lua closure or a native Rust function.
 #[derive(Clone)]
 pub enum LuaFunction {
     Lua(Rc<Closure>),
     Native { name: &'static str, func: NativeFn },
+    WrappedCoroutine { thread: ThreadRef },
 }
 
 impl std::fmt::Debug for LuaFunction {
@@ -102,6 +128,9 @@ impl std::fmt::Debug for LuaFunction {
         match self {
             Self::Lua(c) => write!(f, "function: {:p}", Rc::as_ptr(&c.proto)),
             Self::Native { name, .. } => write!(f, "function: {name}"),
+            Self::WrappedCoroutine { thread } => {
+                write!(f, "function: coroutine.wrap({:p})", Rc::as_ptr(thread))
+            }
         }
     }
 }
